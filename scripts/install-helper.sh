@@ -38,4 +38,13 @@ cat > "$plist" <<PLIST
 PLIST
 chown root:wheel "$plist"
 chmod 644 "$plist"
-launchctl bootstrap system "$plist"
+# launchd can take a moment to finish removing the old copy, and refuses a new one until then.
+attempts=0
+until launchctl bootstrap system "$plist" 2>/dev/null; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 10 ]; then
+    echo "macOS wouldn't start the fan helper. Restart the Mac, then install it again." >&2
+    exit 1
+  fi
+  sleep 1
+done
