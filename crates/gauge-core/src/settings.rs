@@ -154,7 +154,7 @@ impl Default for Settings {
             launch_at_login: false,
             alerts: Alerts::default(),
             order: MODULES.iter().map(|m| m.to_string()).collect(),
-            item_spacing: 0.0,
+            item_spacing: DEFAULT_ITEM_SPACING,
             ping_host: String::new(),
             presets: vec![
                 FanPreset { name: "Auto".into(), mode: FanMode::Auto },
@@ -178,6 +178,7 @@ impl Default for Settings {
 }
 
 pub const MAX_ITEM_SPACING: f64 = 40.0;
+const DEFAULT_ITEM_SPACING: f64 = 20.0;
 
 /// Every monitor exactly once: keeps the saved order, drops unknowns and duplicates, and adds
 /// any monitor a hand-edited or older file is missing.
@@ -353,6 +354,11 @@ mod tests {
         for module in MODULES {
             assert_eq!(order.iter().filter(|m| *m == module).count(), 1);
         }
+    }
+
+    #[test]
+    fn spacing_defaults_to_twenty_points() {
+        assert_eq!(Settings::default().item_spacing, 20.0);
     }
 
     #[test]
