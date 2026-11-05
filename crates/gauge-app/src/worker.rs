@@ -12,7 +12,7 @@ use gauge_core::memory::{self, Memory, Pressure};
 use gauge_core::network::{self, AppTraffic, Counters, InterfaceRate};
 use gauge_core::ping;
 use gauge_core::processor::{Cpu, Sampler, TopProcess};
-use gauge_core::sensors::{AreaTemperature, Fan, Kind, Reading, Sensors, temperature_areas};
+use gauge_core::sensors::{AreaTemperature, Fan, Kind, Reading, Sensors, curve_temperature, temperature_areas};
 use gauge_core::settings::{FanMode, Settings};
 use gauge_core::smart::{self, DriveHealth};
 use gauge_core::wifi::{self, Wifi};
@@ -237,7 +237,11 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
                 }
             }
             let mode = settings.preset().map_or(FanMode::Auto, |p| p.mode.clone());
-            let state = driver.step(&mode, &fans, hot.as_ref().map(|h| h.1));
+            // Reading every sensor costs a little, so it only happens when a curve needs it.
+            let curve_temperature_c = matches!(mode, FanMode::Curve { .. })
+                .then(|| curve_temperature(&temperature_areas(&sensors.read_kind(Kind::Temperature))))
+                .flatten();
+            let state = driver.step(&mode, &fans, curve_temperature_c);
             let _ = updates.send(Update::FanState(state));
             if settings.alerts.hot_enabled
                 && alerts.check("hot", hot.as_ref().is_some_and(|h| h.1 >= settings.alerts.hot_c), ALERT_HOLD_SECONDS, now)

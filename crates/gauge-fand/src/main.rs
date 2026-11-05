@@ -109,7 +109,9 @@ impl Daemon {
         // Hardware takes a moment to report a change, so a quick read-back can look like a failure.
         for _ in 0..5 {
             let written = self.smc.write_u8(&Self::mode_key(fan), AUTO);
-            if written.is_ok() && self.smc.read_u8(&Self::mode_key(fan)) == Ok(AUTO) {
+            // macOS reports its own control as 0 or, once it has settled, as 3.
+            let released = self.smc.read_u8(&Self::mode_key(fan)).is_ok_and(|mode| mode != MANUAL);
+            if written.is_ok() && released {
                 self.pending_release.remove(&fan);
                 return true;
             }

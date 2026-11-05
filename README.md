@@ -16,7 +16,7 @@ Tested on one machine only: an M1 Max MacBook Pro on macOS 27. Other Macs are un
 - Macs that use the lowercase `F0md` key, reportedly the M5, aren't supported.
 - Intel Macs aren't supported.
 
-Fan control so far has been tested with speed changes of about 200 rpm near maximum speed, and with the return to Auto after a disconnect, a hang, a killed app and a crashed helper. Large speed changes and the Cool curve at normal temperatures haven't been tested yet.
+On that Mac, fan control has been tested with both fans moving between 2,000 and 4,000 rpm, and with the return to Auto after a disconnect, a hang, a killed app and a crashed helper. Temperature curves have only run under heavy load, so their behavior at low temperatures hasn't been tested.
 
 ## Features
 

@@ -16,7 +16,7 @@ use gauge_core::wifi::{Wifi, quality_label, snr};
 const HIDDEN_INTERFACE_PREFIXES: [&str; 8] = ["lo", "awdl", "llw", "anpi", "anri", "ap", "gif", "stf"];
 const MAX_OTHER_CONNECTIONS: usize = 3;
 const TOP_ROWS: usize = 5;
-const AUTO_MODE: u8 = 0;
+const MANUAL_MODE: u8 = 1;
 
 pub struct DiskRate {
     pub disk: DiskActivity,
@@ -602,11 +602,10 @@ fn fans_content(latest: &Latest, settings: &Settings) -> Content {
         .fans
         .iter()
         .map(|f| {
-            let mode = if f.mode == AUTO_MODE { "Auto" } else { "Manual" };
-            row(
-                format!("Fan {}", f.index + 1),
-                format!("{:.0} rpm, {mode}", f.actual_rpm),
-            )
+            // Anything but manual is macOS in control: it reports 0, then 3 once settled.
+            let mode = if f.mode == MANUAL_MODE { "Manual" } else { "Auto" };
+            let speed = if f.actual_rpm < 1.0 { "Stopped".to_string() } else { format!("{:.0} rpm", f.actual_rpm) };
+            row(format!("Fan {}", f.index + 1), format!("{speed}, {mode}"))
         })
         .collect();
     rows.push(row("Status", latest.fan_state.label()));
@@ -1100,6 +1099,13 @@ mod tests {
         assert_eq!(format_energy(1234.0), "1.23 kWh");
         assert_eq!(format_watts(1.86), "1.9 W");
         assert_eq!(format_watts(56.4), "56 W");
+    }
+
+    #[test]
+    fn macos_idle_mode_reads_as_auto_and_a_stopped_fan_says_so() {
+        let idle = Fan { mode: 3, actual_rpm: 0.0, ..fan() };
+        let latest = Latest { fans: vec![idle], ..Latest::default() };
+        assert_eq!(value(&content("fans", &latest, &Settings::default()), "Fan 1"), "Stopped, Auto");
     }
 
     #[test]

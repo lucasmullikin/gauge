@@ -159,6 +159,17 @@ pub fn temperature_areas(readings: &[Reading]) -> Vec<AreaTemperature> {
         .collect()
 }
 
+/// What fan curves follow: the warmer of the CPU and GPU averages. Single sensors spike well
+/// above 90C under loads where macOS barely runs the fans, so following the hottest one would
+/// hold them near full speed for no benefit. The helper's safety limit still watches every sensor.
+pub fn curve_temperature(areas: &[AreaTemperature]) -> Option<f32> {
+    areas
+        .iter()
+        .filter(|a| a.area == "CPU" || a.area == "GPU")
+        .map(|a| a.average_c)
+        .max_by(f32::total_cmp)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Fan {
     pub index: u8,
@@ -301,6 +312,14 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], AreaTemperature { area: "CPU", average_c: 70.0, peak_c: 80.0 });
         assert_eq!(got[1].area, "Battery");
+    }
+
+    #[test]
+    fn curves_follow_the_warmer_of_cpu_and_gpu_averages() {
+        let area = |area, average_c, peak_c| AreaTemperature { area, average_c, peak_c };
+        let areas = [area("CPU", 60.0, 97.0), area("GPU", 66.0, 70.0), area("Battery", 80.0, 80.0)];
+        assert_eq!(curve_temperature(&areas), Some(66.0));
+        assert_eq!(curve_temperature(&[area("SSD", 40.0, 40.0)]), None);
     }
 
     #[test]
