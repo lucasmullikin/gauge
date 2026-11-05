@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn hides_system_mounts_and_empty_ones() {
         assert!(is_user_visible("/", "apfs", 0, 100));
-        assert!(is_user_visible("/Volumes/DEPO", "smbfs", 0, 100));
+        assert!(is_user_visible("/Volumes/Media", "smbfs", 0, 100));
         assert!(!is_user_visible("/System/Volumes/Data", "apfs", 0, 100));
         assert!(!is_user_visible("/dev", "devfs", 0, 100));
         assert!(!is_user_visible("/Volumes/x", "apfs", MNT_DONTBROWSE, 100));
