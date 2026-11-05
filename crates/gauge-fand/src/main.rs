@@ -106,13 +106,14 @@ impl Daemon {
 
     fn release(&mut self, fan: u8) -> bool {
         self.owned.remove(&fan);
-        for _ in 0..3 {
+        // Hardware takes a moment to report a change, so a quick read-back can look like a failure.
+        for _ in 0..5 {
             let written = self.smc.write_u8(&Self::mode_key(fan), AUTO);
             if written.is_ok() && self.smc.read_u8(&Self::mode_key(fan)) == Ok(AUTO) {
                 self.pending_release.remove(&fan);
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(100));
         }
         eprintln!("gauge-fand: fan {fan} didn't return to Auto, will keep trying");
         self.pending_release.insert(fan);
