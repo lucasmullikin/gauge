@@ -2,6 +2,10 @@
 
 A macOS menu bar system monitor written in Rust. It shows network speed, RAM, CPU, drives and fans in the menu bar. Click an item for a history graph and details.
 
+![Network, Memory and Fans panels with graphs](docs/images/panels-dark.png)
+
+*Images are drawn by the app using sample data.*
+
 > **Fan control can overheat or damage your Mac if used wrongly.** It uses undocumented Apple interfaces and is provided with no warranty.
 
 ## Status
@@ -26,6 +30,26 @@ Fan control so far has been tested with speed changes of about 200 rpm near maxi
 - **Menu bar:** edit what each item says, add icons, adjust the spacing, and drag items into any order
 - **Alerts:** low disk space, high temperature, memory pressure and lost connection
 - **Command line:** `gauge` prints every reading as JSON
+
+## Screenshots
+
+Drives, CPU and GPU panels:
+
+![Drives, CPU and GPU panels](docs/images/panels-more.png)
+
+Settings has a live copy of your menu bar. Drag an item to move it, or click it to edit:
+
+![Settings window showing the Network page](docs/images/settings-network.png)
+
+Fan settings, with a draggable curve, in light mode:
+
+![Settings window showing the Fans page](docs/images/settings-fans.png)
+
+To regenerate these with sample data:
+
+```bash
+target/release/gauge-app --render gallery network,memory,fans docs/images/panels-dark.png dark
+```
 
 ## Install
 
