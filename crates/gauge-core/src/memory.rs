@@ -139,9 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_this_macs_memory() {
+    fn reads_real_memory() {
         let memory = read().unwrap();
-        assert_eq!(memory.total_bytes, 64 * 1024 * 1024 * 1024);
+        assert!(memory.total_bytes > 0);
         assert!(memory.used_bytes > 0 && memory.used_bytes <= memory.total_bytes);
     }
 }

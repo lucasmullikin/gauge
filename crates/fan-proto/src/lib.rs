@@ -44,10 +44,28 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
     }
 }
 
-/// Requests are clamped to the fan's own limits, so a fan can never be asked to stop.
-pub fn clamp_rpm(rpm: f32, min: f32, max: f32) -> f32 {
-    rpm.clamp(min, max)
+/// Requests are clamped to the fan's own limits, so a fan can never be asked to stop. Limits
+/// that don't make sense are refused, since acting on them could stop a fan or panic here.
+pub fn clamp_rpm(rpm: f32, min: f32, max: f32) -> Option<f32> {
+    (min.is_finite() && max.is_finite() && min > 0.0 && min <= max).then(|| rpm.clamp(min, max))
 }
+
+const BATTERY_LIMIT_C: f32 = 60.0;
+const SSD_LIMIT_C: f32 = 85.0;
+
+/// Puts a reading on the scale of `THERMAL_LIMIT_C`. Batteries and SSDs are hurt by heat a CPU
+/// shrugs off, so they trip the guard at their own, lower temperatures.
+pub fn severity(key: &str, celsius: f32) -> f32 {
+    let limit = match key.get(..2) {
+        Some("TB") => BATTERY_LIMIT_C,
+        Some("TH") => SSD_LIMIT_C,
+        _ => THERMAL_LIMIT_C,
+    };
+    celsius * THERMAL_LIMIT_C / limit
+}
+
+/// After this many one-second checks in a row with macOS taking a fan back, stop fighting it.
+pub const MAX_CONSECUTIVE_REVERTS: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Safety {
@@ -112,9 +130,25 @@ mod tests {
 
     #[test]
     fn clamps_to_the_fans_range() {
-        assert_eq!(clamp_rpm(0.0, 1499.0, 5348.0), 1499.0);
-        assert_eq!(clamp_rpm(9000.0, 1499.0, 5348.0), 5348.0);
-        assert_eq!(clamp_rpm(2500.0, 1499.0, 5348.0), 2500.0);
+        assert_eq!(clamp_rpm(0.0, 1499.0, 5348.0), Some(1499.0));
+        assert_eq!(clamp_rpm(9000.0, 1499.0, 5348.0), Some(5348.0));
+        assert_eq!(clamp_rpm(2500.0, 1499.0, 5348.0), Some(2500.0));
+    }
+
+    #[test]
+    fn nonsense_limits_are_refused_rather_than_used() {
+        assert_eq!(clamp_rpm(2000.0, 0.0, 5348.0), None, "a zero minimum could stop the fan");
+        assert_eq!(clamp_rpm(2000.0, 5348.0, 1499.0), None, "this would panic in clamp");
+        assert_eq!(clamp_rpm(2000.0, f32::NAN, 5348.0), None);
+        assert_eq!(clamp_rpm(2000.0, 1499.0, f32::INFINITY), None);
+    }
+
+    #[test]
+    fn batteries_and_ssds_trip_at_lower_temperatures() {
+        assert_eq!(severity("Tp0D", 100.0), 100.0);
+        assert_eq!(severity("TB1T", 60.0), 100.0);
+        assert_eq!(severity("TH0x", 85.0), 100.0);
+        assert!(severity("TB1T", 35.0) < THERMAL_RESUME_C);
     }
 
     #[test]

@@ -116,11 +116,9 @@ mod tests {
     }
 
     #[test]
-    fn samples_this_macs_cpu() {
+    fn samples_the_real_cpu() {
         let (cpu, processes) = Sampler::new().sample();
-        assert_eq!(cpu.per_core_percent.len(), 10);
-        assert_eq!(cpu.performance_cores, Some(8));
-        assert_eq!(cpu.efficiency_cores, Some(2));
+        assert!(!cpu.per_core_percent.is_empty());
         assert!(!processes.is_empty());
     }
 }

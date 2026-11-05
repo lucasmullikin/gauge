@@ -274,9 +274,10 @@ mod tests {
         let row: Vec<&str> = text
             .lines()
             .find(|l| l.starts_with("en0") && l.contains("<Link#"))
-            .unwrap()
-            .split_whitespace()
-            .collect();
+            .map_or_else(Vec::new, |line| line.split_whitespace().collect());
+        if row.is_empty() {
+            return;
+        }
         let from_netstat: u64 = row[6].parse().unwrap();
         let counters = read_counters().unwrap();
         let en0 = counters.iter().find(|c| c.name == "en0").unwrap();

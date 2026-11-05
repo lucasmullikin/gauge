@@ -148,6 +148,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 settings: Arc::new(Mutex::new(settings.clone())),
                 open_module: AtomicUsize::new(NO_MODULE),
                 install_message: Mutex::new(None),
+                sensors_open: std::sync::atomic::AtomicBool::new(false),
             });
             let latest = if real {
                 shared.open_module.store(index, std::sync::atomic::Ordering::Relaxed);
@@ -170,14 +171,27 @@ pub fn run(args: &[String]) -> Result<(), String> {
             panel.refresh_graphs(&history, &settings, drawn_at, true);
             write_png(&on_background(mtm, panel.root_view(), dark), path)
         }
+        "sensors" => {
+            // Real readings, so this is for checking only and isn't used for public images.
+            let readings = gauge_core::sensors::Sensors::open().map_err(|e| e.to_string())?.read();
+            let window = crate::sensors_window::SensorsWindow::new(mtm);
+            window.set_rows(&crate::view::sensor_rows(&readings, gauge_core::sensors::is_m1_mac(), &settings));
+            let content = window.window.contentView().ok_or("no content")?;
+            content.layoutSubtreeIfNeeded();
+            write_png(&content, path)
+        }
         "settings" => {
             let page: i64 = name.parse().map_err(|_| "bad page")?;
+            let mut settings = settings;
+            if rest.iter().any(|a| a == "many") {
+                while settings.add_preset().is_some() {}
+            }
             let callbacks = crate::order_view::PreviewCallbacks {
                 on_order: Box::new(|_| {}),
                 on_select: Box::new(|_| {}),
             };
             let window = SettingsWindow::new(mtm, target, callbacks);
-            window.show_page(mtm, page, &settings, target, Box::new(|_| {}));
+            window.show_page(mtm, page, &settings, target, std::rc::Rc::new(|_, _| {}));
             window.set_preview(crate::view::preview_items(&demo_latest(), &settings), settings.item_spacing);
             let content = window.window.contentView().ok_or("no content")?;
             let plate = on_background(mtm, &content, dark);
@@ -197,7 +211,7 @@ fn demo_latest() -> Latest {
     use gauge_core::memory::{Memory, Pressure};
     use gauge_core::network::{AppTraffic, InterfaceRate};
     use gauge_core::processor::{Cpu, TopProcess};
-    use gauge_core::sensors::Fan;
+    use gauge_core::sensors::{AreaTemperature, Fan};
     use gauge_core::smart::{DriveHealth, Health};
     use gauge_core::wifi::Wifi;
     let process = |name: &str, cpu_percent: f32, memory_gb: u64| TopProcess {
@@ -344,6 +358,15 @@ fn demo_latest() -> Latest {
         }),
         fan_state: crate::fan_control::FanState::Holding,
         install_message: None,
+        sensors: Vec::new(),
+        device_batteries: Vec::new(),
+        temperatures: vec![
+            AreaTemperature { area: "CPU", average_c: 58.0, peak_c: 71.0 },
+            AreaTemperature { area: "GPU", average_c: 52.0, peak_c: 60.0 },
+            AreaTemperature { area: "Memory", average_c: 47.0, peak_c: 50.0 },
+            AreaTemperature { area: "SSD", average_c: 36.0, peak_c: 38.0 },
+            AreaTemperature { area: "Battery", average_c: 31.0, peak_c: 32.0 },
+        ],
     }
 }
 

@@ -3,4 +3,5 @@
 set -eu
 label=com.gauge.fand
 launchctl bootout "system/$label" 2>/dev/null || true
-rm -f "/Library/LaunchDaemons/$label.plist" "/Library/PrivilegedHelperTools/$label" /var/run/gauge-fand.sock
+rm -f "/Library/LaunchDaemons/$label.plist" "/Library/PrivilegedHelperTools/$label" \
+  "/Library/PrivilegedHelperTools/$label-uninstall" /var/run/gauge-fand.sock

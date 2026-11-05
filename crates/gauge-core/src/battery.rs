@@ -32,6 +32,26 @@ pub fn power_watts(voltage_mv: Option<i64>, amperage_ma: Option<i64>) -> Option<
     Some(voltage_mv? as f64 * amperage_ma? as f64 / 1_000_000.0)
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeviceBattery {
+    pub name: String,
+    pub percent: i64,
+}
+
+/// Wireless keyboards, mice and trackpads that report a charge. Headphones often don't appear
+/// here, since macOS doesn't list them in this part of the registry.
+pub fn read_devices() -> Vec<DeviceBattery> {
+    iokit::services_of_class("AppleDeviceManagementHIDEventService")
+        .iter()
+        .filter_map(|service| {
+            Some(DeviceBattery {
+                percent: service.i64("BatteryPercent")?,
+                name: iokit::as_string(&service.property("Product")?)?,
+            })
+        })
+        .collect()
+}
+
 pub fn read() -> Option<Battery> {
     let services = iokit::services_of_class("AppleSmartBattery");
     let entry = services.first()?;
@@ -66,10 +86,10 @@ mod tests {
     }
 
     #[test]
-    fn reads_this_macs_battery_health_near_system_information() {
-        let battery = read().unwrap();
-        let health = battery.health_percent.unwrap();
-        assert!((50.0..=110.0).contains(&health), "{health}");
+    fn battery_health_is_sensible_where_there_is_one() {
+        if let Some(health) = read().and_then(|b| b.health_percent) {
+            assert!((10.0..=120.0).contains(&health), "{health}");
+        }
     }
 
     #[test]

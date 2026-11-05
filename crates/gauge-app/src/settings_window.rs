@@ -7,7 +7,7 @@ use crate::settings_form::{self, Control, FormRow, PAGES, icon_tag};
 use crate::ui::{fix_width, horizontal_stack, label, vertical_stack};
 use crate::view::ICONS;
 use gauge_core::curve::CurvePoint;
-use gauge_core::settings::{FanMode, MODULES, Settings, parse_color};
+use gauge_core::settings::{MODULES, Settings, parse_color};
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{MainThreadOnly, sel};
@@ -15,11 +15,12 @@ use objc2_app_kit::{
     NSBackingStoreType, NSBezelStyle, NSBox, NSBoxType, NSButton,
     NSButtonType, NSColor, NSColorWell, NSColorWellStyle, NSControlStateValueOff, NSControlStateValueOn, NSFont,
     NSFontAttributeName, NSForegroundColorAttributeName, NSLayoutAttribute, NSPopUpButton,
-    NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView, NSTextAlignment, NSTextField, NSView,
-    NSWindow, NSWindowStyleMask,
+    NSLayoutConstraint, NSScreen, NSScrollView, NSSegmentSwitchTracking, NSSegmentedControl, NSSlider, NSStackView,
+    NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{MainThreadMarker, NSArray, NSAttributedString, NSDictionary, NSMutableAttributedString, NSPoint, NSRect, NSSize, NSString};
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 const LABEL_WIDTH: f64 = 120.0;
 const CONTROL_WIDTH: f64 = 360.0;
@@ -29,13 +30,18 @@ const MARGIN: f64 = 16.0;
 const PREVIEW_HEIGHT: f64 = 30.0;
 const ICON_COLUMNS: usize = 10;
 const READOUT_WIDTH: f64 = 70.0;
-pub const FANS_PAGE: i64 = 6;
+const SCROLLER_ROOM: f64 = 16.0;
+const WINDOW_CHROME_HEIGHT: f64 = 120.0;
+const FALLBACK_SCREEN_HEIGHT: f64 = 800.0;
+/// Tall enough to show the whole sidebar.
+const MIN_PAGE_HEIGHT: f64 = 240.0;
 
 pub struct SettingsWindow {
     pub window: Retained<NSWindow>,
-    host: Retained<NSStackView>,
+    scroll: Retained<NSScrollView>,
     sidebar: Vec<Retained<NSButton>>,
     preview: Retained<MenuBarPreview>,
+    scroll_height: Retained<NSLayoutConstraint>,
     current: RefCell<Option<Retained<NSStackView>>>,
     readouts: RefCell<Vec<(i64, Retained<NSTextField>, &'static str)>>,
     page: Cell<i64>,
@@ -131,7 +137,7 @@ fn icon_palette(mtm: MainThreadMarker, page: i64, target: &AnyObject) -> Retaine
 impl SettingsWindow {
     pub fn new(mtm: MainThreadMarker, target: &AnyObject, callbacks: PreviewCallbacks) -> SettingsWindow {
         let style = NSWindowStyleMask::Titled | NSWindowStyleMask::Closable | NSWindowStyleMask::Miniaturizable;
-        let width = SIDEBAR_WIDTH + FORM_WIDTH + MARGIN * 3.0;
+        let width = SIDEBAR_WIDTH + FORM_WIDTH + SCROLLER_ROOM + MARGIN * 3.0;
         // SAFETY: the rect and style are valid. The window stays alive with this struct, and
         // isn't released on close so it can be shown again.
         let window = unsafe {
@@ -179,8 +185,19 @@ impl SettingsWindow {
             sidebar.push(button);
         }
         columns.addArrangedSubview(&side);
-        let host = vertical_stack(mtm, 0.0, 0.0);
-        columns.addArrangedSubview(&host);
+        // Pages scroll, since a long list of fan presets can be taller than the screen.
+        let scroll = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            NSRect::new(NSPoint::ZERO, NSSize::new(FORM_WIDTH, 400.0)),
+        );
+        scroll.setHasVerticalScroller(true);
+        scroll.setAutohidesScrollers(true);
+        scroll.setDrawsBackground(false);
+        scroll.setTranslatesAutoresizingMaskIntoConstraints(false);
+        scroll.widthAnchor().constraintEqualToConstant(FORM_WIDTH + SCROLLER_ROOM).setActive(true);
+        let scroll_height = scroll.heightAnchor().constraintEqualToConstant(400.0);
+        scroll_height.setActive(true);
+        columns.addArrangedSubview(&scroll);
         columns.setEdgeInsets(objc2_foundation::NSEdgeInsets { top: 0.0, left: MARGIN, bottom: MARGIN, right: MARGIN });
         root.addArrangedSubview(&columns);
         // Fitted stacks ignore bottom insets, so a spacer holds the window's bottom margin.
@@ -192,7 +209,8 @@ impl SettingsWindow {
         window.center();
         SettingsWindow {
             window,
-            host,
+            scroll,
+            scroll_height,
             sidebar,
             preview,
             current: RefCell::new(None),
@@ -223,12 +241,34 @@ impl SettingsWindow {
         }
     }
 
-    fn control_for(&self, mtm: MainThreadMarker, row: &FormRow, page: i64, target: &AnyObject) -> Retained<NSView> {
+    fn control_for(
+        &self,
+        mtm: MainThreadMarker,
+        row: &FormRow,
+        page: i64,
+        target: &AnyObject,
+        on_curve: &Rc<dyn Fn(usize, Vec<CurvePoint>)>,
+    ) -> Retained<NSView> {
         let action = Some(sel!(settingChanged:));
         // SAFETY: the target outlives the window and implements the action.
         unsafe {
             match &row.control {
                 Control::Heading => NSView::new(mtm),
+                Control::Note(text) => {
+                    let note = label(mtm, text, 11.0, false);
+                    note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    Retained::into_super(Retained::into_super(note))
+                }
+                Control::Curve(points) => {
+                    let column = vertical_stack(mtm, 4.0, 0.0);
+                    let index = settings_form::preset_index(row.tag).unwrap_or(0);
+                    let on_curve = on_curve.clone();
+                    column.addArrangedSubview(&CurveView::new(mtm, CONTROL_WIDTH, 110.0, points.clone(), Box::new(move |points| on_curve(index, points))));
+                    let note = label(mtm, "Drag the points. Left to right is 30–105°C, bottom to top is speed.", 11.0, false);
+                    note.setTextColor(Some(&NSColor::secondaryLabelColor()));
+                    column.addArrangedSubview(&note);
+                    Retained::into_super(column)
+                }
                 Control::Checkbox(on) => {
                     let button = NSButton::checkboxWithTitle_target_action(&NSString::from_str(""), Some(target), action, mtm);
                     button.setState(if *on { NSControlStateValueOn } else { NSControlStateValueOff });
@@ -269,7 +309,8 @@ impl SettingsWindow {
                     field.setTarget(Some(target));
                     field.setAction(action);
                     field.setTag(row.tag as isize);
-                    field.setContinuous(true);
+                    // Preset names apply on Return, since renaming rebuilds the panels.
+                    field.setContinuous(settings_form::preset_index(row.tag).is_none());
                     fix_width(&field, CONTROL_WIDTH);
                     Retained::into_super(Retained::into_super(field))
                 }
@@ -296,17 +337,14 @@ impl SettingsWindow {
         page: i64,
         settings: &Settings,
         target: &AnyObject,
-        on_curve: Box<dyn Fn(Vec<CurvePoint>)>,
+        on_curve: Rc<dyn Fn(usize, Vec<CurvePoint>)>,
     ) {
         self.page.set(page);
         for (index, button) in self.sidebar.iter().enumerate() {
             button.setState(if index as i64 == page { NSControlStateValueOn } else { NSControlStateValueOff });
             button.setAttributedTitle(&sidebar_title(index, index as i64 == page, settings));
         }
-        if let Some(previous) = self.current.borrow_mut().take() {
-            self.host.removeArrangedSubview(&previous);
-            previous.removeFromSuperview();
-        }
+        self.current.borrow_mut().take();
         self.readouts.borrow_mut().clear();
         let form = vertical_stack(mtm, 9.0, 0.0);
         form.addArrangedSubview(&label(mtm, PAGES[page as usize], 20.0, true));
@@ -315,7 +353,7 @@ impl SettingsWindow {
                 let spacer = NSView::new(mtm);
                 spacer.heightAnchor().constraintEqualToConstant(4.0).setActive(true);
                 form.addArrangedSubview(&spacer);
-                form.addArrangedSubview(&label(mtm, row.label, 13.0, true));
+                form.addArrangedSubview(&label(mtm, &row.label, 13.0, true));
                 let rule = NSBox::new(mtm);
                 rule.setBoxType(NSBoxType::Separator);
                 fix_width(&rule, FORM_WIDTH);
@@ -323,58 +361,56 @@ impl SettingsWindow {
                 continue;
             }
             let line = horizontal_stack(mtm, 12.0);
-            line.setAlignment(if matches!(row.control, Control::Colors(..)) {
+            line.setAlignment(if matches!(row.control, Control::Curve(_)) {
+                NSLayoutAttribute::Top
+            } else if matches!(row.control, Control::Colors(..)) {
                 NSLayoutAttribute::CenterY
             } else {
                 NSLayoutAttribute::FirstBaseline
             });
-            let name = label(mtm, row.label, 13.0, false);
+            let name = label(mtm, &row.label, 13.0, false);
             name.setAlignment(NSTextAlignment::Right);
             name.setTextColor(Some(&NSColor::secondaryLabelColor()));
             fix_width(&name, LABEL_WIDTH);
             line.addArrangedSubview(&name);
-            line.addArrangedSubview(&self.control_for(mtm, &row, page, target));
+            line.addArrangedSubview(&self.control_for(mtm, &row, page, target, &on_curve));
             form.addArrangedSubview(&line);
         }
-        if page == FANS_PAGE {
-            let line = horizontal_stack(mtm, 12.0);
-            line.setAlignment(NSLayoutAttribute::Top);
-            let name = label(mtm, "Cool curve", 13.0, false);
-            name.setAlignment(NSTextAlignment::Right);
-            name.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            fix_width(&name, LABEL_WIDTH);
-            line.addArrangedSubview(&name);
-            let points = settings
-                .presets
-                .iter()
-                .find_map(|p| match &p.mode {
-                    FanMode::Curve { points } => Some(points.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let column = vertical_stack(mtm, 4.0, 0.0);
-            column.addArrangedSubview(&CurveView::new(mtm, CONTROL_WIDTH, 110.0, points, on_curve));
-            let note = label(mtm, "Drag the points. Left to right is 30–105°C, bottom to top is speed.", 11.0, false);
-            note.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            column.addArrangedSubview(&note);
-            let safety = label(mtm, "Fans return to Auto if Gauge quits or stays above 100°C.", 11.0, false);
-            safety.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            column.addArrangedSubview(&safety);
-            line.addArrangedSubview(&column);
-            form.addArrangedSubview(&line);
-        }
-        self.host.addArrangedSubview(&form);
+        form.layoutSubtreeIfNeeded();
+        let height = form.fittingSize().height;
+        form.setTranslatesAutoresizingMaskIntoConstraints(true);
+        form.setFrame(NSRect::new(NSPoint::ZERO, NSSize::new(FORM_WIDTH, height)));
+        self.scroll.setDocumentView(Some(&form));
+        self.scroll_height.setConstant(page_height(height, self.available_height(mtm)));
+        form.scrollPoint(NSPoint::new(0.0, if form.isFlipped() { 0.0 } else { height }));
         *self.current.borrow_mut() = Some(form);
         if let Some(content) = self.window.contentView() {
             content.layoutSubtreeIfNeeded();
             self.window.setContentSize(content.fittingSize());
         }
     }
+
+    /// Room for a page after the window's title bar, menu bar preview and margins.
+    fn available_height(&self, mtm: MainThreadMarker) -> f64 {
+        NSScreen::mainScreen(mtm).map_or(FALLBACK_SCREEN_HEIGHT, |s| s.visibleFrame().size.height) - WINDOW_CHROME_HEIGHT
+    }
+}
+
+/// A page's height, up to what fits on screen. Anything taller scrolls.
+pub fn page_height(content: f64, available: f64) -> f64 {
+    content.min(available.max(MIN_PAGE_HEIGHT)).max(MIN_PAGE_HEIGHT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tall_pages_scroll_and_short_ones_keep_the_sidebar_visible() {
+        assert_eq!(page_height(600.0, 900.0), 600.0);
+        assert_eq!(page_height(1400.0, 900.0), 900.0);
+        assert_eq!(page_height(100.0, 900.0), MIN_PAGE_HEIGHT);
+    }
 
     #[test]
     fn readouts_are_whole_numbers_with_their_unit() {

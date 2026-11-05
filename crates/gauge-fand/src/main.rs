@@ -5,11 +5,11 @@
 //! restarts this after a crash, startup restores Auto too.
 
 use fan_proto::{
-    CLIENT_TIMEOUT_SECONDS, Command, MAX_LINE_BYTES, SOCKET_PATH, Safety, ThermalGuard, clamp_rpm,
-    parse_command,
+    CLIENT_TIMEOUT_SECONDS, Command, MAX_CONSECUTIVE_REVERTS, MAX_LINE_BYTES, SOCKET_PATH, Safety,
+    ThermalGuard, clamp_rpm, parse_command, severity,
 };
 use smc::{Error, Smc};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
@@ -22,8 +22,17 @@ const MANUAL: u8 = 1;
 const TICK: Duration = Duration::from_millis(250);
 const SAFETY_EVERY: Duration = Duration::from_secs(1);
 const SENSOR_MIN_C: f32 = 15.0;
+/// Only used to skip junk sensors at startup. See `Daemon::hottest` for later readings.
 const SENSOR_MAX_C: f32 = 115.0;
+/// Exit code for a Mac this helper can't support, so launchd doesn't keep restarting it.
+const EXIT_UNSUPPORTED: i32 = 0;
 const TARGET_TOLERANCE_RPM: f32 = 1.0;
+/// Enough to serve a normal client, and short enough that a flood can't stall the safety checks.
+/// The hardware takes a moment to report a new setting, so a just-changed fan isn't checked yet.
+/// Without this, every speed change looked like macOS taking the fan back.
+const SETTLE_TIME: Duration = Duration::from_secs(2);
+const MAX_COMMANDS_PER_TICK: usize = 8;
+const MAX_BUFFERED_BYTES: usize = 1024;
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -34,11 +43,17 @@ extern "C" fn on_signal(_: libc::c_int) {
 struct Daemon {
     smc: Smc,
     fans: u8,
-    temperature_keys: Vec<u32>,
+    /// Sensors that read sensibly at startup, so unconnected ones can't trip the guard.
+    temperature_keys: Vec<(String, u32)>,
     /// Fans currently under manual control, with their requested speed.
     owned: BTreeMap<u8, f32>,
+    /// Fans that didn't accept going back to Auto. Retried until they do.
+    pending_release: BTreeSet<u8>,
+    /// When each fan's requested speed last changed.
+    changed_at: BTreeMap<u8, Instant>,
     guard: ThermalGuard,
     reverts: u64,
+    consecutive_reverts: u32,
 }
 
 impl Daemon {
@@ -48,8 +63,11 @@ impl Daemon {
         let mut temperature_keys = Vec::new();
         for index in 0..smc.key_count()? {
             let Ok(key) = smc.key_at(index) else { continue };
-            if key.starts_with('T') && smc.read_f32(&key).is_ok() {
-                temperature_keys.push(smc::fourcc(&key)?);
+            if key.starts_with('T')
+                && smc.read_f32(&key).is_ok_and(|c| (SENSOR_MIN_C..=SENSOR_MAX_C).contains(&c))
+            {
+                let code = smc::fourcc(&key)?;
+                temperature_keys.push((key, code));
             }
         }
         Ok(Daemon {
@@ -57,17 +75,29 @@ impl Daemon {
             fans,
             temperature_keys,
             owned: BTreeMap::new(),
+            pending_release: BTreeSet::new(),
+            changed_at: BTreeMap::new(),
             guard: ThermalGuard::default(),
             reverts: 0,
+            consecutive_reverts: 0,
         })
     }
 
+    /// The worst sensor, scaled for its type. A sensor that worked at startup and now reads
+    /// very high counts as hot rather than broken. Losing most sensors counts as unknown.
     fn hottest(&self) -> Option<f32> {
-        self.temperature_keys
+        let readings: Vec<f32> = self
+            .temperature_keys
             .iter()
-            .filter_map(|key| self.smc.read_known_f32(*key).ok())
-            .filter(|c| (SENSOR_MIN_C..=SENSOR_MAX_C).contains(c))
-            .max_by(f32::total_cmp)
+            .filter_map(|(name, code)| {
+                let c = self.smc.read_known_f32(*code).ok()?;
+                (c.is_finite() && c >= SENSOR_MIN_C).then(|| severity(name, c))
+            })
+            .collect();
+        if readings.len() * 2 < self.temperature_keys.len() {
+            return None;
+        }
+        readings.into_iter().max_by(f32::total_cmp)
     }
 
     fn mode_key(fan: u8) -> String {
@@ -76,14 +106,16 @@ impl Daemon {
 
     fn release(&mut self, fan: u8) -> bool {
         self.owned.remove(&fan);
-        for _ in 0..5 {
+        for _ in 0..3 {
             let written = self.smc.write_u8(&Self::mode_key(fan), AUTO);
             if written.is_ok() && self.smc.read_u8(&Self::mode_key(fan)) == Ok(AUTO) {
+                self.pending_release.remove(&fan);
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(50));
         }
-        eprintln!("gauge-fand: fan {fan} could not be returned to Auto");
+        eprintln!("gauge-fand: fan {fan} didn't return to Auto, will keep trying");
+        self.pending_release.insert(fan);
         false
     }
 
@@ -109,9 +141,15 @@ impl Daemon {
                 .read_f32(&format!("F{fan}{suffix}"))
                 .map_err(|e| e.to_string())
         };
-        let rpm = clamp_rpm(rpm, read("Mn")?, read("Mx")?);
-        self.write_manual(fan, rpm).map_err(|e| e.to_string())?;
-        self.owned.insert(fan, rpm);
+        let rpm = clamp_rpm(rpm, read("Mn")?, read("Mx")?).ok_or("fan limits don't make sense")?;
+        if let Err(error) = self.write_manual(fan, rpm) {
+            // Manual mode may have taken before the speed failed, so don't leave it that way.
+            self.release(fan);
+            return Err(error.to_string());
+        }
+        if self.owned.insert(fan, rpm) != Some(rpm) {
+            self.changed_at.insert(fan, Instant::now());
+        }
         Ok(rpm)
     }
 
@@ -120,28 +158,43 @@ impl Daemon {
         self.smc.write_f32(&format!("F{fan}Tg"), rpm)
     }
 
-    /// Runs once a second: enforces the thermal limit and restores anything macOS took back.
-    /// With no fans under manual control there's nothing to guard, so it costs nothing.
+    /// Runs once a second: enforces the thermal limit, retries failed releases, and restores
+    /// anything macOS took back. With nothing under manual control, it costs nothing.
     fn safety_tick(&mut self) {
+        for fan in self.pending_release.clone() {
+            self.release(fan);
+        }
         if self.owned.is_empty() {
             return;
         }
-        if self.guard.update(self.hottest()) == Safety::ThermalHold && !self.owned.is_empty() {
+        if self.guard.update(self.hottest()) == Safety::ThermalHold {
             eprintln!("gauge-fand: thermal hold, returning fans to Auto");
             self.release_all();
+            return;
         }
+        let mut reverted = false;
         for (fan, rpm) in self.owned.clone() {
+            if self.changed_at.get(&fan).is_some_and(|at| at.elapsed() < SETTLE_TIME) {
+                continue;
+            }
             let mode = self.smc.read_u8(&Self::mode_key(fan));
             let target = self.smc.read_f32(&format!("F{fan}Tg"));
             let held = mode == Ok(MANUAL)
                 && target.is_ok_and(|t| (t - rpm).abs() <= TARGET_TOLERANCE_RPM);
             if !held {
+                reverted = true;
                 self.reverts += 1;
                 if self.write_manual(fan, rpm).is_err() {
                     eprintln!("gauge-fand: fan {fan} refused a re-apply, returning it to Auto");
                     self.release(fan);
                 }
             }
+        }
+        self.consecutive_reverts = if reverted { self.consecutive_reverts + 1 } else { 0 };
+        if self.consecutive_reverts >= MAX_CONSECUTIVE_REVERTS {
+            eprintln!("gauge-fand: macOS keeps taking the fans back, leaving them with it");
+            self.consecutive_reverts = 0;
+            self.release_all();
         }
     }
 
@@ -211,7 +264,8 @@ fn service_client(client: &mut Client, daemon: &mut Daemon) -> bool {
         Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {}
         Err(_) => return false,
     }
-    while let Some(end) = client.buffer.iter().position(|b| *b == b'\n') {
+    for _ in 0..MAX_COMMANDS_PER_TICK {
+        let Some(end) = client.buffer.iter().position(|b| *b == b'\n') else { break };
         let line: Vec<u8> = client.buffer.drain(..=end).collect();
         client.last_message = Instant::now();
         let reply = daemon.handle(String::from_utf8_lossy(&line).trim());
@@ -219,15 +273,22 @@ fn service_client(client: &mut Client, daemon: &mut Daemon) -> bool {
             return false;
         }
     }
-    client.buffer.len() <= MAX_LINE_BYTES
+    let has_full_line = client.buffer.contains(&b'\n');
+    client.buffer.len() <= MAX_BUFFERED_BYTES && (has_full_line || client.buffer.len() <= MAX_LINE_BYTES)
+}
+
+/// Newer chips use different fan keys, and these write paths are only tested on the older ones.
+fn is_supported(smc: &Smc) -> bool {
+    smc.info("Ftst").is_err() && smc.read_u8("F0Md").is_ok()
 }
 
 fn run(allow_uid: libc::uid_t) -> Result<(), String> {
     let mut daemon = Daemon::open().map_err(|e| e.to_string())?;
-    if daemon.smc.info("Ftst").is_ok() {
-        return Err("this Mac needs the Ftst unlock, which this helper doesn't support".into());
-    }
     daemon.release_all();
+    if !is_supported(&daemon.smc) {
+        eprintln!("gauge-fand: fan control isn't supported on this Mac");
+        std::process::exit(EXIT_UNSUPPORTED);
+    }
     let listener = bind(allow_uid).map_err(|e| format!("bind: {e}"))?;
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: the handler only stores to an atomic.
@@ -267,11 +328,15 @@ fn run(allow_uid: libc::uid_t) -> Result<(), String> {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let allow_uid = match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        ["--check"] => {
+            let supported = Smc::open().is_ok_and(|smc| is_supported(&smc));
+            std::process::exit(if supported { 0 } else { 3 });
+        }
         ["--allow-uid", uid] => uid.parse::<libc::uid_t>().ok(),
         _ => None,
     };
     let Some(allow_uid) = allow_uid else {
-        eprintln!("usage: gauge-fand --allow-uid UID");
+        eprintln!("usage: gauge-fand --allow-uid UID | --check");
         std::process::exit(2);
     };
     if let Err(message) = run(allow_uid) {

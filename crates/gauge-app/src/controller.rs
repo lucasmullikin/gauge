@@ -5,12 +5,14 @@ use crate::graph_math::{Unit, fraction, log_floor, nice_max};
 use crate::order_view::PreviewCallbacks;
 use crate::panel::Panel;
 use crate::settings_form::{self, Input};
+use crate::sensors_window::SensorsWindow;
 use crate::settings_window::SettingsWindow;
 use crate::view::{self, Latest};
 use crate::worker::{self, NO_MODULE, Shared, Update};
 use gauge_core::curve::CurvePoint;
 use gauge_core::history::{bridge_gaps, bucketize};
-use gauge_core::settings::{BarStyle, FanMode, GraphScale, MODULES, Settings, normalized_order, support_dir};
+use gauge_core::sensors::is_m1_mac;
+use gauge_core::settings::{BarStyle, GraphScale, MODULES, Settings, normalized_order, support_dir};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{DefinedClass, MainThreadOnly, Message, define_class, msg_send, sel};
@@ -19,8 +21,10 @@ use objc2_app_kit::{
     NSControlStateValueOn, NSFont, NSFontAttributeName, NSPopUpButton, NSPopoverDelegate,
     NSSegmentedControl, NSSlider, NSStatusBar, NSStatusItem, NSStringDrawing, NSTextField,
 };
+use objc2_core_location::CLLocationManager;
 use objc2_foundation::{MainThreadMarker, NSDictionary, NSNotification, NSRectEdge, NSRunLoop, NSString, NSTimer};
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -58,6 +62,8 @@ pub struct Ivars {
     modules: RefCell<Vec<Module>>,
     latest: RefCell<Latest>,
     settings_window: RefCell<Option<SettingsWindow>>,
+    sensors_window: RefCell<Option<SensorsWindow>>,
+    location: RefCell<Option<Retained<CLLocationManager>>>,
     last_closed: Cell<Option<(usize, Instant)>>,
 }
 
@@ -199,12 +205,17 @@ define_class!(
         #[unsafe(method(fixedChanged:))]
         fn fixed_changed(&self, sender: &NSSlider) {
             let percent = sender.doubleValue() as f32;
-            self.change_settings(|settings| settings_form::set_fixed_percent(settings, percent));
+            self.change_settings(|settings| settings_form::set_active_fixed_percent(settings, percent));
         }
 
         #[unsafe(method(installHelper:))]
         fn install_helper(&self, _sender: &NSButton) {
             self.on_install_helper();
+        }
+
+        #[unsafe(method(openSensors:))]
+        fn open_sensors(&self, _sender: &NSButton) {
+            self.show_sensors();
         }
 
         #[unsafe(method(openSettings:))]
@@ -237,10 +248,23 @@ impl Controller {
             modules: RefCell::new(Vec::new()),
             latest: RefCell::new(Latest::default()),
             settings_window: RefCell::new(None),
+            sensors_window: RefCell::new(None),
+            location: RefCell::new(None),
             last_closed: Cell::new(None),
         });
         // SAFETY: NSObject's init takes no arguments and the ivars are set.
         unsafe { msg_send![super(this), init] }
+    }
+
+    /// macOS shows its own prompt the first time. The manager must stay alive for that.
+    fn request_location(&self) {
+        // SAFETY: documented calls on a live manager, on the main thread.
+        let manager = unsafe {
+            let manager = CLLocationManager::new();
+            manager.requestWhenInUseAuthorization();
+            manager
+        };
+        *self.ivars().location.borrow_mut() = Some(manager);
     }
 
     fn save_history(&self) {
@@ -330,6 +354,32 @@ impl Controller {
         }
         self.refresh_open(false);
         self.refresh_preview();
+        self.refresh_sensors();
+    }
+
+    fn refresh_sensors(&self) {
+        let window = self.ivars().sensors_window.borrow();
+        let open = window.as_ref().is_some_and(|w| w.window.isVisible());
+        self.ivars().shared.sensors_open.store(open, Ordering::Relaxed);
+        if let Some(window) = window.as_ref().filter(|_| open) {
+            let latest = self.ivars().latest.borrow();
+            window.set_rows(&view::sensor_rows(&latest.sensors, is_m1_mac(), &self.settings()));
+        }
+    }
+
+    fn show_sensors(&self) {
+        let mtm = self.mtm();
+        if self.ivars().sensors_window.borrow().is_none() {
+            *self.ivars().sensors_window.borrow_mut() = Some(SensorsWindow::new(mtm));
+        }
+        for module in self.ivars().modules.borrow().iter() {
+            module.panel.popover.close();
+        }
+        NSApplication::sharedApplication(mtm).activate();
+        if let Some(window) = &*self.ivars().sensors_window.borrow() {
+            window.window.makeKeyAndOrderFront(None);
+        }
+        self.ivars().shared.sensors_open.store(true, Ordering::Relaxed);
     }
 
     fn refresh_bar(&self) {
@@ -363,7 +413,7 @@ impl Controller {
             } else if now - module.last_image_at.get() >= 2 {
                 module.last_image_at.set(now);
                 module.has_image.set(true);
-                button.setImage(Some(&self.bar_graph(module.name, now, &settings)));
+                button.setImage(Some(&bar_image::image(&self.bar_shares(module.name, now, &settings))));
                 button.setImagePosition(if style == BarStyle::Graph {
                     NSCellImagePosition::ImageOnly
                 } else {
@@ -384,25 +434,30 @@ impl Controller {
         self.refresh_bar();
     }
 
-    fn bar_graph(&self, name: &str, now: i64, settings: &Settings) -> Retained<objc2_app_kit::NSImage> {
+    /// Recent values for a menu bar graph: one list per series, on one shared scale.
+    fn bar_shares(&self, name: &str, now: i64, settings: &Settings) -> Vec<Vec<f32>> {
         let specs = view::graphs(name, settings);
-        let mut shares = vec![0.0; BAR_GRAPH_POINTS];
-        if let (Some(spec), Ok(history)) = (specs.first(), self.ivars().shared.history.lock())
-            && let Some((series, _)) = spec.series.first()
-        {
-            let rows = history.rows(series, BAR_GRAPH_SECONDS, now).unwrap_or_default();
-            let mut buckets = bucketize(&rows, now - BAR_GRAPH_SECONDS, now, BAR_GRAPH_POINTS);
-            bridge_gaps(&mut buckets, BAR_GRAPH_SECONDS as f64 / BAR_GRAPH_POINTS as f64, 60.0);
-            let peak = buckets.iter().flatten().map(|b| b.avg).fold(0.0, f32::max);
-            let max = spec.unit.fixed_max().unwrap_or_else(|| nice_max(peak));
-            let scale = if spec.unit == Unit::Rate { GraphScale::Log } else { GraphScale::Linear };
-            let floor = log_floor(buckets.iter().flatten().map(|b| b.avg).filter(|v| *v > 0.0).min_by(f32::total_cmp), max, spec.unit);
-            shares = buckets
-                .iter()
-                .map(|b| b.map_or(0.0, |b| fraction(b.avg, max, floor, scale)))
-                .collect();
-        }
-        bar_image::image(&shares)
+        let (Some(spec), Ok(history)) = (specs.first(), self.ivars().shared.history.lock()) else {
+            return Vec::new();
+        };
+        let buckets: Vec<_> = spec
+            .series
+            .iter()
+            .map(|(series, _)| {
+                let rows = history.rows(series, BAR_GRAPH_SECONDS, now).unwrap_or_default();
+                let mut buckets = bucketize(&rows, now - BAR_GRAPH_SECONDS, now, BAR_GRAPH_POINTS);
+                bridge_gaps(&mut buckets, BAR_GRAPH_SECONDS as f64 / BAR_GRAPH_POINTS as f64, 60.0);
+                buckets
+            })
+            .collect();
+        let values = || buckets.iter().flatten().flatten().map(|b| b.avg);
+        let max = spec.unit.fixed_max().unwrap_or_else(|| nice_max(values().fold(0.0, f32::max)));
+        let scale = if spec.unit == Unit::Rate { GraphScale::Log } else { GraphScale::Linear };
+        let floor = log_floor(values().filter(|v| *v > 0.0).min_by(f32::total_cmp), max, spec.unit);
+        buckets
+            .iter()
+            .map(|series| series.iter().map(|b| b.map_or(0.0, |b| fraction(b.avg, max, floor, scale))).collect())
+            .collect()
     }
 
     fn refresh_open(&self, force: bool) {
@@ -536,14 +591,8 @@ impl Controller {
 
     fn show_settings_page(&self, page: i64) {
         let this = self.retain();
-        let on_curve = Box::new(move |points: Vec<CurvePoint>| {
-            this.change_settings(|settings| {
-                for preset in &mut settings.presets {
-                    if matches!(preset.mode, FanMode::Curve { .. }) {
-                        preset.mode = FanMode::Curve { points: points.clone() };
-                    }
-                }
-            });
+        let on_curve: Rc<dyn Fn(usize, Vec<CurvePoint>)> = Rc::new(move |index, points| {
+            this.change_settings(|settings| settings_form::set_preset_curve(settings, index, points));
         });
         if let Some(window) = &*self.ivars().settings_window.borrow() {
             window.show_page(self.mtm(), page, &self.settings(), self.target(), on_curve);
@@ -552,6 +601,10 @@ impl Controller {
 
     fn on_setting_changed(&self, sender: &NSControl) {
         let tag = sender.tag() as i64;
+        if let Some(page) = settings_form::page_opened_by(tag) {
+            self.show_settings_page(page);
+            return;
+        }
         let any: &AnyObject = sender.as_ref();
         let input = if let Some(menu) = any.downcast_ref::<NSPopUpButton>() {
             Input::Index(menu.indexOfSelectedItem().max(0) as usize)
@@ -579,10 +632,18 @@ impl Controller {
             settings_form::apply(settings, tag, input);
         });
         let after = self.settings();
+        if after.show_wifi_name && !before.show_wifi_name {
+            self.request_location();
+        }
         if before.launch_at_login != after.launch_at_login {
             sync_login_agent(after.launch_at_login);
         }
-        let layout = |s: &Settings| MODULES.map(|m| s.module(m).map(|x| (x.shown, x.bar_style)));
+        let layout = |s: &Settings| {
+            (
+                MODULES.map(|m| s.module(m).map(|x| (x.shown, x.bar_style))),
+                s.presets.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+            )
+        };
         if layout(&before) != layout(&after) {
             self.rebuild_items();
         } else {
@@ -720,6 +781,11 @@ impl Controller {
         self.spin(1.0);
         let visible = self.ivars().settings_window.borrow().as_ref().is_some_and(|w| w.window.isVisible());
         check("settings window opens", visible);
+        self.show_sensors();
+        self.spin(4.5);
+        let sensor_count = self.ivars().latest.borrow().sensors.len();
+        println!("     sensors listed: {sensor_count}");
+        check("sensor window receives readings", sensor_count > 0);
         for page in 0..settings_form::PAGES.len() as i64 {
             self.show_settings_page(page);
         }

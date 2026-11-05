@@ -10,6 +10,7 @@ mod order_view;
 mod panel;
 mod render;
 mod settings_form;
+mod sensors_window;
 mod settings_window;
 mod ui;
 mod view;
@@ -66,6 +67,7 @@ fn main() {
         settings: Arc::new(Mutex::new(settings)),
         open_module: AtomicUsize::new(NO_MODULE),
         install_message: Mutex::new(None),
+        sensors_open: std::sync::atomic::AtomicBool::new(false),
     });
     let (sender, receiver) = mpsc::channel();
     let worker_shared = shared.clone();

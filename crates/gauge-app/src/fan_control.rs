@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-const IO_TIMEOUT: Duration = Duration::from_secs(1);
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum FanState {
@@ -20,6 +20,8 @@ pub enum FanState {
     Overridden,
     ThermalHold,
     HelperMissing,
+    /// The helper didn't answer in time. Dropping the connection returns fans to Auto.
+    HelperBusy,
     Error(String),
 }
 
@@ -31,6 +33,7 @@ impl FanState {
             FanState::Overridden => "macOS keeps taking control back".into(),
             FanState::ThermalHold => "Too hot, handed back to macOS".into(),
             FanState::HelperMissing => "Fan helper not installed".into(),
+            FanState::HelperBusy => "Fan helper didn't answer, trying again".into(),
             FanState::Error(message) => format!("Error: {message}"),
         }
     }
@@ -78,6 +81,10 @@ pub fn install_result(success: bool, stderr: &str) -> String {
     } else {
         format!("Install failed: {}", stderr.trim())
     }
+}
+
+fn is_timeout(kind: std::io::ErrorKind) -> bool {
+    matches!(kind, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)
 }
 
 struct Connection {
@@ -134,6 +141,8 @@ impl FanDriver {
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
                 ) {
                     FanState::HelperMissing
+                } else if is_timeout(error.kind()) {
+                    FanState::HelperBusy
                 } else {
                     FanState::Error(error.to_string())
                 }
@@ -208,6 +217,14 @@ mod tests {
     fn thermal_hold_takes_priority() {
         let status = HelperStatus { hold: true, reverts: 9 };
         assert_eq!(state_from_status(&status, 1), FanState::ThermalHold);
+    }
+
+    #[test]
+    fn a_slow_helper_reads_as_busy_not_a_raw_error() {
+        assert!(is_timeout(std::io::ErrorKind::WouldBlock));
+        assert!(is_timeout(std::io::ErrorKind::TimedOut));
+        assert!(!is_timeout(std::io::ErrorKind::NotFound));
+        assert_eq!(FanState::HelperBusy.label(), "Fan helper didn't answer, trying again");
     }
 
     #[test]

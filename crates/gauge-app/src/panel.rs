@@ -121,6 +121,11 @@ impl Panel {
         let graphs: Vec<(Retained<GraphView>, GraphSpec)> = specs
             .into_iter()
             .map(|spec| {
+                if let Some(caption) = spec.caption {
+                    let name = label(mtm, caption, 11.0, false);
+                    name.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
+                    root.addArrangedSubview(&name);
+                }
                 let graph = GraphView::new(mtm, CONTENT_WIDTH, spec.height);
                 root.addArrangedSubview(&graph);
                 (graph, spec)
@@ -143,7 +148,11 @@ impl Panel {
         root.addArrangedSubview(&details);
 
         let footer = horizontal_stack(mtm, 8.0);
-        for (text, action) in [("Settings…", sel!(openSettings:)), ("Quit Gauge", sel!(quit:))] {
+        let mut buttons = vec![("Settings…", sel!(openSettings:)), ("Quit Gauge", sel!(quit:))];
+        if module == "fans" {
+            buttons.insert(0, ("All sensors…", sel!(openSensors:)));
+        }
+        for (text, action) in buttons {
             // SAFETY: the target outlives the panel and implements the action.
             let button = unsafe {
                 NSButton::buttonWithTitle_target_action(&NSString::from_str(text), Some(target), Some(action), mtm)
@@ -211,8 +220,8 @@ impl Panel {
     fn refresh_fan(&self, fan: &FanControls, latest: &Latest, settings: &Settings) {
         let selected = settings.presets.iter().position(|p| p.name == settings.active_preset);
         fan.presets.setSelectedSegment(selected.map_or(-1, |i| i as isize));
-        let fixed = settings.preset().and_then(|p| match (&p.name[..], &p.mode) {
-            ("Fixed", FanMode::Fixed { percent }) => Some(*percent),
+        let fixed = settings.preset().and_then(|p| match &p.mode {
+            FanMode::Fixed { percent } => Some(*percent),
             _ => None,
         });
         let show_install = latest.fan_state == crate::fan_control::FanState::HelperMissing;

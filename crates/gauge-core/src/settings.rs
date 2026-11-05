@@ -125,6 +125,8 @@ pub struct Settings {
     pub temperature_unit: TemperatureUnit,
     pub show_top_apps: bool,
     pub show_wifi: bool,
+    /// macOS treats the network name as location data, so this asks for Location permission.
+    pub show_wifi_name: bool,
     pub launch_at_login: bool,
     pub alerts: Alerts,
     /// Menu bar items, leftmost first.
@@ -151,6 +153,7 @@ impl Default for Settings {
             temperature_unit: TemperatureUnit::Celsius,
             show_top_apps: true,
             show_wifi: true,
+            show_wifi_name: false,
             launch_at_login: false,
             alerts: Alerts::default(),
             order: MODULES.iter().map(|m| m.to_string()).collect(),
@@ -177,6 +180,8 @@ impl Default for Settings {
     }
 }
 
+pub const MAX_PRESETS: usize = 8;
+pub const AUTO_PRESET: &str = "Auto";
 pub const MAX_ITEM_SPACING: f64 = 40.0;
 const DEFAULT_ITEM_SPACING: f64 = 20.0;
 
@@ -235,6 +240,66 @@ impl Settings {
         })
     }
 
+    /// Keeps presets usable after hand-editing: Auto always comes first, and names are present
+    /// and unique. It's what fans fall back to, so it can't be lost.
+    pub fn normalize_presets(&mut self) {
+        let mut seen: Vec<String> = vec![AUTO_PRESET.to_string()];
+        let mut kept = vec![FanPreset { name: AUTO_PRESET.to_string(), mode: FanMode::Auto }];
+        for preset in self.presets.drain(..) {
+            let name = preset.name.trim().to_string();
+            if name.is_empty() || seen.contains(&name) || kept.len() >= MAX_PRESETS {
+                continue;
+            }
+            seen.push(name.clone());
+            kept.push(FanPreset { name, mode: preset.mode });
+        }
+        self.presets = kept;
+        if !self.presets.iter().any(|p| p.name == self.active_preset) {
+            AUTO_PRESET.clone_into(&mut self.active_preset);
+        }
+    }
+
+    /// Adds a preset with a free name. `None` when the list is full.
+    pub fn add_preset(&mut self) -> Option<usize> {
+        if self.presets.len() >= MAX_PRESETS {
+            return None;
+        }
+        let name = (1..)
+            .map(|n| format!("Preset {n}"))
+            .find(|name| !self.presets.iter().any(|p| p.name == *name))?;
+        self.presets.push(FanPreset { name, mode: FanMode::Fixed { percent: 50.0 } });
+        Some(self.presets.len() - 1)
+    }
+
+    /// Auto can't be removed. Deleting the active preset returns the fans to Auto.
+    pub fn delete_preset(&mut self, index: usize) -> bool {
+        if index == 0 || index >= self.presets.len() {
+            return false;
+        }
+        let removed = self.presets.remove(index);
+        if removed.name == self.active_preset {
+            AUTO_PRESET.clone_into(&mut self.active_preset);
+        }
+        true
+    }
+
+    /// Refuses empty and duplicate names, and any change to Auto.
+    pub fn rename_preset(&mut self, index: usize, name: &str) -> bool {
+        let name = name.trim();
+        if index == 0
+            || index >= self.presets.len()
+            || name.is_empty()
+            || self.presets.iter().enumerate().any(|(i, p)| i != index && p.name == name)
+        {
+            return false;
+        }
+        if self.presets[index].name == self.active_preset {
+            name.clone_into(&mut self.active_preset);
+        }
+        name.clone_into(&mut self.presets[index].name);
+        true
+    }
+
     /// Each monitor's main color, in `MODULES` order.
     pub fn module_colors(&self) -> Vec<&str> {
         MODULES.iter().filter_map(|name| self.module(name).map(|m| m.color.as_str())).collect()
@@ -254,6 +319,7 @@ impl Settings {
         "Auto".clone_into(&mut settings.active_preset);
         settings.order = normalized_order(&settings.order);
         settings.item_spacing = settings.item_spacing.clamp(0.0, MAX_ITEM_SPACING);
+        settings.normalize_presets();
         for name in MODULES {
             if let Some(module) = settings.module_mut(name) {
                 module.range_index = module.range_index.min(RANGES_SECONDS.len() - 1);
@@ -354,6 +420,57 @@ mod tests {
         for module in MODULES {
             assert_eq!(order.iter().filter(|m| *m == module).count(), 1);
         }
+    }
+
+    #[test]
+    fn auto_always_exists_first_and_names_stay_unique() {
+        let mut settings = Settings {
+            presets: vec![
+                FanPreset { name: "Quiet".into(), mode: FanMode::Fixed { percent: 10.0 } },
+                FanPreset { name: "Quiet".into(), mode: FanMode::Fixed { percent: 20.0 } },
+                FanPreset { name: " ".into(), mode: FanMode::Auto },
+                FanPreset { name: "Auto".into(), mode: FanMode::Fixed { percent: 0.0 } },
+            ],
+            ..Settings::default()
+        };
+        settings.normalize_presets();
+        let names: Vec<&str> = settings.presets.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["Auto", "Quiet"]);
+        assert_eq!(settings.presets[0].mode, FanMode::Auto);
+    }
+
+    #[test]
+    fn presets_can_be_added_up_to_the_limit_with_free_names() {
+        let mut settings = Settings::default();
+        let start = settings.presets.len();
+        assert_eq!(settings.add_preset(), Some(start));
+        assert_eq!(settings.presets[start].name, "Preset 1");
+        while settings.presets.len() < MAX_PRESETS {
+            assert!(settings.add_preset().is_some());
+        }
+        assert_eq!(settings.add_preset(), None);
+    }
+
+    #[test]
+    fn deleting_keeps_auto_and_moves_the_active_preset_to_auto() {
+        let mut settings = Settings { active_preset: "Max".into(), ..Settings::default() };
+        assert!(!settings.delete_preset(0));
+        let max = settings.presets.iter().position(|p| p.name == "Max").unwrap();
+        assert!(settings.delete_preset(max));
+        assert_eq!(settings.active_preset, "Auto");
+        assert!(!settings.delete_preset(99));
+    }
+
+    #[test]
+    fn renaming_refuses_bad_names_and_follows_the_active_preset() {
+        let mut settings = Settings { active_preset: "Cool".into(), ..Settings::default() };
+        let cool = settings.presets.iter().position(|p| p.name == "Cool").unwrap();
+        assert!(!settings.rename_preset(0, "Other"));
+        assert!(!settings.rename_preset(cool, "  "));
+        assert!(!settings.rename_preset(cool, "Max"));
+        assert!(settings.rename_preset(cool, " Night "));
+        assert_eq!(settings.presets[cool].name, "Night");
+        assert_eq!(settings.active_preset, "Night");
     }
 
     #[test]

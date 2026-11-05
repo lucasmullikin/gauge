@@ -4,7 +4,7 @@
 use crate::fan_control::{FanDriver, FanState};
 use crate::view::{DiskRate, memory_percent};
 use gauge_core::alerts::AlertTracker;
-use gauge_core::battery::{self, Battery};
+use gauge_core::battery::{self, Battery, DeviceBattery};
 use gauge_core::drives::{self, DiskActivity, Volume};
 use gauge_core::gpu::{self, Gpu};
 use gauge_core::history::{History, local_day, month_start_day};
@@ -12,7 +12,7 @@ use gauge_core::memory::{self, Memory, Pressure};
 use gauge_core::network::{self, AppTraffic, Counters, InterfaceRate};
 use gauge_core::ping;
 use gauge_core::processor::{Cpu, Sampler, TopProcess};
-use gauge_core::sensors::{Fan, Sensors};
+use gauge_core::sensors::{AreaTemperature, Fan, Kind, Reading, Sensors, temperature_areas};
 use gauge_core::settings::{FanMode, Settings};
 use gauge_core::smart::{self, DriveHealth};
 use gauge_core::wifi::{self, Wifi};
@@ -32,6 +32,7 @@ const ROUTE_EVERY: u64 = 10;
 const BATTERY_EVERY: u64 = 30;
 const FLUSH_EVERY: u64 = 60;
 const SMART_EVERY: u64 = 60;
+const SENSOR_LIST_EVERY: u64 = 3;
 const PING_INTERVAL: Duration = Duration::from_secs(5);
 const PING_TIMEOUT: Duration = Duration::from_secs(2);
 const APP_SAMPLE_SECONDS: u32 = 1;
@@ -53,6 +54,9 @@ pub enum Update {
     Fans(Vec<Fan>, Option<(String, f32)>),
     FanState(FanState),
     Battery(Option<Battery>),
+    Sensors(Vec<Reading>),
+    Temperatures(Vec<AreaTemperature>),
+    DeviceBatteries(Vec<DeviceBattery>),
 }
 
 pub struct Shared {
@@ -61,6 +65,8 @@ pub struct Shared {
     /// Index into `MODULES` of the panel that's open, or `NO_MODULE`.
     pub open_module: AtomicUsize,
     pub install_message: Mutex<Option<String>>,
+    /// Reading every sensor is costly, so it only happens while their window is open.
+    pub sensors_open: AtomicBool,
 }
 
 fn now_seconds() -> i64 {
@@ -127,6 +133,7 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
     let memory_index = 1;
     let cpu_index = 2;
     let drives_index = 4;
+    let fans_index = 5;
     loop {
         std::thread::sleep(TICK);
         let now = now_seconds();
@@ -236,6 +243,16 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
                 notify("This Mac is running very hot");
             }
             let _ = updates.send(Update::Fans(fans, hot));
+            if open == fans_index {
+                let _ = updates.send(Update::Temperatures(temperature_areas(&sensors.read_kind(Kind::Temperature))));
+            }
+        }
+
+        if let Some(sensors) = &sensors
+            && shared.sensors_open.load(Ordering::Relaxed)
+            && tick.is_multiple_of(SENSOR_LIST_EVERY)
+        {
+            let _ = updates.send(Update::Sensors(sensors.read()));
         }
 
         if tick.is_multiple_of(DRIVE_EVERY) {
@@ -277,6 +294,7 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
                 history.record("battery.percent", now, percent as f32);
             }
             let _ = updates.send(Update::Battery(battery));
+            let _ = updates.send(Update::DeviceBatteries(battery::read_devices()));
         }
 
         if open == drives_index && last_smart.is_none_or(|at| tick >= at + SMART_EVERY) {
@@ -334,5 +352,8 @@ pub fn absorb(latest: &mut crate::view::Latest, update: Update) {
         }
         Update::FanState(state) => latest.fan_state = state,
         Update::Battery(battery) => latest.battery = battery,
+        Update::Sensors(sensors) => latest.sensors = sensors,
+        Update::Temperatures(areas) => latest.temperatures = areas,
+        Update::DeviceBatteries(devices) => latest.device_batteries = devices,
     }
 }

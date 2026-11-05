@@ -3,13 +3,23 @@
 
 use crate::view;
 use gauge_core::settings::{
-    BarStyle, FanMode, GraphScale, GraphStyle, MAX_ITEM_SPACING, MODULES, RANGE_LABELS, RANGES_SECONDS, Settings,
-    TemperatureUnit,
+    BarStyle, FanMode, GraphScale, GraphStyle, MAX_ITEM_SPACING, MAX_PRESETS, MODULES, RANGE_LABELS, RANGES_SECONDS,
+    Settings, TemperatureUnit,
 };
+use gauge_core::curve::CurvePoint;
 
-pub const PAGES: [&str; 9] = ["General", "Network", "Memory", "CPU", "GPU", "Drives", "Fans", "Battery", "Alerts"];
+pub const PAGES: [&str; 10] = ["General", "Network", "Memory", "CPU", "GPU", "Drives", "Fans", "Battery", "Alerts", "Fan presets"];
 const GENERAL: i64 = 0;
 const ALERTS: i64 = 8;
+pub const PRESETS: i64 = 9;
+const FIELD_EDIT_PRESETS: i64 = 30;
+const FIELD_ADD_PRESET: i64 = 1;
+const PRESET_TAG_BASE: i64 = 1_000_000;
+const PRESET_NAME: i64 = 0;
+const PRESET_KIND: i64 = 1;
+const PRESET_SPEED: i64 = 2;
+const PRESET_DELETE: i64 = 3;
+const PRESET_CURVE: i64 = 4;
 const FIELD_SHOWN: i64 = 0;
 const FIELD_BAR: i64 = 1;
 const FIELD_STYLE: i64 = 2;
@@ -24,8 +34,8 @@ const FIELD_ADD_ICON: i64 = 10;
 const FIELD_RESET_TEXT: i64 = 11;
 const FIELD_TOP_APPS: i64 = 20;
 const FIELD_WIFI: i64 = 21;
+const FIELD_WIFI_NAME: i64 = 23;
 const FIELD_PING: i64 = 22;
-const FIELD_FIXED: i64 = 30;
 const FIELD_UNIT: i64 = 1;
 const FIELD_LOGIN: i64 = 2;
 const FIELD_SPACING: i64 = 3;
@@ -47,11 +57,15 @@ pub enum Control {
     Icons,
     /// A button that runs a command.
     Button(&'static str),
+    /// A draggable fan curve. The row's tag says which preset it belongs to.
+    Curve(Vec<CurvePoint>),
+    /// Plain explanatory text.
+    Note(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FormRow {
-    pub label: &'static str,
+    pub label: String,
     pub control: Control,
     pub tag: i64,
 }
@@ -65,8 +79,111 @@ pub enum Input {
     Number(f64),
 }
 
-fn heading(label: &'static str) -> FormRow {
-    FormRow { label, control: Control::Heading, tag: -1 }
+fn heading(label: impl Into<String>) -> FormRow {
+    FormRow { label: label.into(), control: Control::Heading, tag: -1 }
+}
+
+pub fn preset_tag(index: usize, field: i64) -> i64 {
+    PRESET_TAG_BASE + index as i64 * 100 + field
+}
+
+/// Which preset a curve's tag belongs to.
+pub fn preset_index(tag: i64) -> Option<usize> {
+    (tag >= PRESET_TAG_BASE).then(|| ((tag - PRESET_TAG_BASE) / 100) as usize)
+}
+
+fn preset_rows(settings: &Settings) -> Vec<FormRow> {
+    let mut form = vec![FormRow {
+        label: "Auto".into(),
+        control: Control::Note("Lets macOS control the fans. This one can't be changed or removed."),
+        tag: -1,
+    }];
+    for (index, preset) in settings.presets.iter().enumerate().skip(1) {
+        form.push(heading(preset.name.clone()));
+        form.push(FormRow {
+            label: "Name".into(),
+            control: Control::Text(preset.name.clone(), "Name this preset"),
+            tag: preset_tag(index, PRESET_NAME),
+        });
+        let is_curve = matches!(preset.mode, FanMode::Curve { .. });
+        form.push(FormRow {
+            label: "Type".into(),
+            control: Control::Segmented(vec!["Fixed speed", "Temperature curve"], usize::from(is_curve)),
+            tag: preset_tag(index, PRESET_KIND),
+        });
+        match &preset.mode {
+            FanMode::Curve { points } => form.push(FormRow {
+                label: "Curve".into(),
+                control: Control::Curve(points.clone()),
+                tag: preset_tag(index, PRESET_CURVE),
+            }),
+            FanMode::Fixed { percent } => form.push(FormRow {
+                label: "Speed".into(),
+                control: Control::Slider { value: f64::from(*percent), min: 0.0, max: 100.0, unit: "%" },
+                tag: preset_tag(index, PRESET_SPEED),
+            }),
+            FanMode::Auto => {}
+        }
+        form.push(FormRow {
+            label: String::new(),
+            control: Control::Button("Delete preset"),
+            tag: preset_tag(index, PRESET_DELETE),
+        });
+    }
+    if settings.presets.len() < MAX_PRESETS {
+        form.push(heading("New"));
+        form.push(FormRow {
+            label: String::new(),
+            control: Control::Button("Add preset"),
+            tag: PRESETS * 100 + FIELD_ADD_PRESET,
+        });
+    }
+    form
+}
+
+fn default_curve() -> Vec<CurvePoint> {
+    vec![
+        CurvePoint { temp_c: 45.0, percent: 10.0 },
+        CurvePoint { temp_c: 65.0, percent: 45.0 },
+        CurvePoint { temp_c: 80.0, percent: 80.0 },
+        CurvePoint { temp_c: 90.0, percent: 100.0 },
+    ]
+}
+
+/// For a Button that opens another settings page rather than changing anything.
+pub fn page_opened_by(tag: i64) -> Option<i64> {
+    (tag == 6 * 100 + FIELD_EDIT_PRESETS).then_some(PRESETS)
+}
+
+fn apply_preset(settings: &mut Settings, tag: i64, input: Input) -> bool {
+    let (index, field) = (((tag - PRESET_TAG_BASE) / 100) as usize, (tag - PRESET_TAG_BASE) % 100);
+    if index == 0 || index >= settings.presets.len() {
+        return false;
+    }
+    match (field, input) {
+        (PRESET_NAME, Input::Text(name)) => settings.rename_preset(index, &name),
+        (PRESET_DELETE, Input::Index(_)) => settings.delete_preset(index),
+        (PRESET_SPEED, Input::Number(value)) => {
+            settings.presets[index].mode = FanMode::Fixed { percent: (value as f32).clamp(0.0, 100.0) };
+            true
+        }
+        (PRESET_KIND, Input::Index(kind)) => {
+            let is_curve = matches!(settings.presets[index].mode, FanMode::Curve { .. });
+            if kind == 1 && !is_curve {
+                settings.presets[index].mode = FanMode::Curve { points: default_curve() };
+            } else if kind == 0 && is_curve {
+                settings.presets[index].mode = FanMode::Fixed { percent: 50.0 };
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+pub fn set_preset_curve(settings: &mut Settings, index: usize, points: Vec<CurvePoint>) {
+    if index > 0 && let Some(preset) = settings.presets.get_mut(index) {
+        preset.mode = FanMode::Curve { points };
+    }
 }
 
 const ICON_TAG_BASE: i64 = 100_000;
@@ -94,15 +211,15 @@ fn module_rows(page: i64, settings: &Settings) -> Vec<FormRow> {
     let scale = usize::from(module.graph_scale == GraphScale::Log);
     vec![
         heading("Menu bar"),
-        FormRow { label: "Show this item", control: Control::Checkbox(module.shown), tag: tag(FIELD_SHOWN) },
-        FormRow { label: "Display", control: Control::Segmented(vec!["Text", "Graph", "Both"], bar), tag: tag(FIELD_BAR) },
+        FormRow { label: "Show this item".into(), control: Control::Checkbox(module.shown), tag: tag(FIELD_SHOWN) },
+        FormRow { label: "Display".into(), control: Control::Segmented(vec!["Text", "Graph", "Both"], bar), tag: tag(FIELD_BAR) },
         FormRow {
-            label: "Text",
+            label: "Text".into(),
             control: Control::Text(view::template_for(name, settings).to_string(), "Empty shows no text"),
             tag: tag(FIELD_TEMPLATE),
         },
         FormRow {
-            label: "Add value",
+            label: "Add value".into(),
             control: Control::Menu(
                 std::iter::once("Choose a value".to_string())
                     .chain(view::tokens(name).iter().map(|t| t.label.to_string()))
@@ -110,31 +227,22 @@ fn module_rows(page: i64, settings: &Settings) -> Vec<FormRow> {
             ),
             tag: tag(FIELD_ADD_VALUE),
         },
-        FormRow { label: "Add icon", control: Control::Icons, tag: tag(FIELD_ADD_ICON) },
-        FormRow { label: "", control: Control::Button("Reset text"), tag: tag(FIELD_RESET_TEXT) },
+        FormRow { label: "Add icon".into(), control: Control::Icons, tag: tag(FIELD_ADD_ICON) },
+        FormRow { label: "".into(), control: Control::Button("Reset text"), tag: tag(FIELD_RESET_TEXT) },
         heading("Graph"),
-        FormRow { label: "Style", control: Control::Segmented(vec!["Line", "Area", "Bars"], style), tag: tag(FIELD_STYLE) },
-        FormRow { label: "Scale", control: Control::Segmented(vec!["Linear", "Logarithmic"], scale), tag: tag(FIELD_SCALE) },
-        FormRow { label: "Time range", control: Control::Segmented(RANGE_LABELS.to_vec(), module.range_index), tag: tag(FIELD_RANGE) },
-        FormRow { label: "Show peaks", control: Control::Checkbox(module.show_peaks), tag: tag(FIELD_PEAKS) },
-        FormRow { label: "Colors", control: Control::Colors(module.color.clone(), module.secondary_color.clone()), tag: tag(FIELD_COLOR) },
+        FormRow { label: "Style".into(), control: Control::Segmented(vec!["Line", "Area", "Bars"], style), tag: tag(FIELD_STYLE) },
+        FormRow { label: "Scale".into(), control: Control::Segmented(vec!["Linear", "Logarithmic"], scale), tag: tag(FIELD_SCALE) },
+        FormRow { label: "Time range".into(), control: Control::Segmented(RANGE_LABELS.to_vec(), module.range_index), tag: tag(FIELD_RANGE) },
+        FormRow { label: "Show peaks".into(), control: Control::Checkbox(module.show_peaks), tag: tag(FIELD_PEAKS) },
+        FormRow { label: "Colors".into(), control: Control::Colors(module.color.clone(), module.secondary_color.clone()), tag: tag(FIELD_COLOR) },
     ]
 }
 
-fn fixed_percent(settings: &Settings) -> f32 {
-    settings
-        .presets
-        .iter()
-        .find_map(|p| match (&p.name[..], &p.mode) {
-            ("Fixed", FanMode::Fixed { percent }) => Some(*percent),
-            _ => None,
-        })
-        .unwrap_or(50.0)
-}
-
-pub fn set_fixed_percent(settings: &mut Settings, percent: f32) {
+/// Moves the panel's slider into the active preset, if that preset is a fixed speed.
+pub fn set_active_fixed_percent(settings: &mut Settings, percent: f32) {
+    let active = settings.active_preset.clone();
     for preset in &mut settings.presets {
-        if preset.name == "Fixed" {
+        if preset.name == active && matches!(preset.mode, FanMode::Fixed { .. }) {
             preset.mode = FanMode::Fixed { percent: percent.clamp(0.0, 100.0) };
         }
     }
@@ -144,13 +252,13 @@ pub fn rows(page: i64, settings: &Settings) -> Vec<FormRow> {
     match page {
         GENERAL => vec![
             FormRow {
-                label: "Temperature",
+                label: "Temperature".into(),
                 control: Control::Segmented(vec!["Celsius", "Fahrenheit"], usize::from(settings.temperature_unit == TemperatureUnit::Fahrenheit)),
                 tag: FIELD_UNIT,
             },
-            FormRow { label: "Open at login", control: Control::Checkbox(settings.launch_at_login), tag: FIELD_LOGIN },
+            FormRow { label: "Open at login".into(), control: Control::Checkbox(settings.launch_at_login), tag: FIELD_LOGIN },
             FormRow {
-                label: "Item spacing",
+                label: "Item spacing".into(),
                 control: Control::Slider { value: settings.item_spacing, min: 0.0, max: MAX_ITEM_SPACING, unit: " pt" },
                 tag: FIELD_SPACING,
             },
@@ -159,35 +267,47 @@ pub fn rows(page: i64, settings: &Settings) -> Vec<FormRow> {
             let a = &settings.alerts;
             vec![
                 heading("Storage"),
-                FormRow { label: "Startup disk low", control: Control::Checkbox(a.disk_low_enabled), tag: ALERTS * 100 },
-                FormRow { label: "Alert below", control: Control::Slider { value: f64::from(a.disk_low_percent), min: 1.0, max: 50.0, unit: "% free" }, tag: ALERTS * 100 + 1 },
+                FormRow { label: "Startup disk low".into(), control: Control::Checkbox(a.disk_low_enabled), tag: ALERTS * 100 },
+                FormRow { label: "Alert below".into(), control: Control::Slider { value: f64::from(a.disk_low_percent), min: 1.0, max: 50.0, unit: "% free" }, tag: ALERTS * 100 + 1 },
                 heading("Temperature"),
-                FormRow { label: "Running hot", control: Control::Checkbox(a.hot_enabled), tag: ALERTS * 100 + 2 },
-                FormRow { label: "Alert above", control: Control::Slider { value: f64::from(a.hot_c), min: 60.0, max: 110.0, unit: "°C" }, tag: ALERTS * 100 + 3 },
+                FormRow { label: "Running hot".into(), control: Control::Checkbox(a.hot_enabled), tag: ALERTS * 100 + 2 },
+                FormRow { label: "Alert above".into(), control: Control::Slider { value: f64::from(a.hot_c), min: 60.0, max: 110.0, unit: "°C" }, tag: ALERTS * 100 + 3 },
                 heading("System"),
-                FormRow { label: "Memory pressure critical", control: Control::Checkbox(a.memory_pressure_enabled), tag: ALERTS * 100 + 4 },
-                FormRow { label: "Connection down", control: Control::Checkbox(a.connection_down_enabled), tag: ALERTS * 100 + 5 },
+                FormRow { label: "Memory pressure critical".into(), control: Control::Checkbox(a.memory_pressure_enabled), tag: ALERTS * 100 + 4 },
+                FormRow { label: "Connection down".into(), control: Control::Checkbox(a.connection_down_enabled), tag: ALERTS * 100 + 5 },
             ]
         }
+        PRESETS => preset_rows(settings),
         _ if (1..=7).contains(&page) => {
             let mut form = module_rows(page, settings);
             match MODULES[page as usize - 1] {
                 "network" => {
                     form.push(heading("Details"));
-                    form.push(FormRow { label: "Show top apps", control: Control::Checkbox(settings.show_top_apps), tag: page * 100 + FIELD_TOP_APPS });
-                    form.push(FormRow { label: "Show Wi-Fi details", control: Control::Checkbox(settings.show_wifi), tag: page * 100 + FIELD_WIFI });
+                    form.push(FormRow { label: "Show top apps".into(), control: Control::Checkbox(settings.show_top_apps), tag: page * 100 + FIELD_TOP_APPS });
+                    form.push(FormRow { label: "Show Wi-Fi details".into(), control: Control::Checkbox(settings.show_wifi), tag: page * 100 + FIELD_WIFI });
+                    form.push(FormRow { label: "Show Wi-Fi name".into(), control: Control::Checkbox(settings.show_wifi_name), tag: page * 100 + FIELD_WIFI_NAME });
                     form.push(FormRow {
-                        label: "Ping address",
+                        label: String::new(),
+                        control: Control::Note("Showing the name asks for Location permission. macOS treats it as location data."),
+                        tag: -1,
+                    });
+                    form.push(FormRow {
+                        label: "Ping address".into(),
                         control: Control::Text(settings.ping_host.clone(), "Your gateway, which stays on your network"),
                         tag: page * 100 + FIELD_PING,
                     });
                 }
                 "fans" => {
-                    form.push(heading("Fan speeds"));
+                    form.push(heading("Fan control"));
                     form.push(FormRow {
-                        label: "Fixed preset",
-                        control: Control::Slider { value: f64::from(fixed_percent(settings)), min: 0.0, max: 100.0, unit: "%" },
-                        tag: page * 100 + FIELD_FIXED,
+                        label: "Presets".into(),
+                        control: Control::Button("Edit fan presets"),
+                        tag: page * 100 + FIELD_EDIT_PRESETS,
+                    });
+                    form.push(FormRow {
+                        label: String::new(),
+                        control: Control::Note("Fans return to Auto if Gauge quits or stays above 100°C."),
+                        tag: -1,
                     });
                 }
                 _ => {}
@@ -200,7 +320,8 @@ pub fn rows(page: i64, settings: &Settings) -> Vec<FormRow> {
 
 /// Checkboxes report their state; plain buttons just say they were pressed.
 pub fn input_for_button(tag: i64, on: bool) -> Input {
-    if tag >= ICON_TAG_BASE || tag % 100 == FIELD_RESET_TEXT {
+    let is_preset_button = tag >= PRESET_TAG_BASE || tag == PRESETS * 100 + FIELD_ADD_PRESET;
+    if tag >= ICON_TAG_BASE || is_preset_button || tag % 100 == FIELD_RESET_TEXT {
         Input::Index(1)
     } else {
         Input::Bool(on)
@@ -209,7 +330,8 @@ pub fn input_for_button(tag: i64, on: bool) -> Input {
 
 /// Commands change a text field that's on screen, so its page must be rebuilt to show that.
 pub fn needs_page_refresh(tag: i64) -> bool {
-    tag >= ICON_TAG_BASE || tag / 100 != 0 && matches!(tag % 100, FIELD_ADD_VALUE | FIELD_ADD_ICON | FIELD_RESET_TEXT)
+    let edits_preset_list = tag >= PRESET_TAG_BASE && (tag - PRESET_TAG_BASE) % 100 != PRESET_SPEED;
+    edits_preset_list || tag == PRESETS * 100 + FIELD_ADD_PRESET || tag >= ICON_TAG_BASE || tag / 100 != 0 && matches!(tag % 100, FIELD_ADD_VALUE | FIELD_ADD_ICON | FIELD_RESET_TEXT)
 }
 
 fn append_to_template(settings: &mut Settings, name: &str, text: &str) {
@@ -222,6 +344,12 @@ fn append_to_template(settings: &mut Settings, name: &str, text: &str) {
 
 /// Returns false for a tag or value that doesn't fit, leaving settings unchanged.
 pub fn apply(settings: &mut Settings, tag: i64, input: Input) -> bool {
+    if tag >= PRESET_TAG_BASE {
+        return apply_preset(settings, tag, input);
+    }
+    if tag == PRESETS * 100 + FIELD_ADD_PRESET {
+        return settings.add_preset().is_some();
+    }
     if tag >= ICON_TAG_BASE {
         let (page, index) = ((tag - ICON_TAG_BASE) / 100, (tag - ICON_TAG_BASE) % 100);
         return match (usize::try_from(page - 1).ok().and_then(|p| MODULES.get(p)), view::ICONS.get(index as usize)) {
@@ -247,8 +375,8 @@ pub fn apply(settings: &mut Settings, tag: i64, input: Input) -> bool {
         (ALERTS, 5, Input::Bool(on)) => settings.alerts.connection_down_enabled = on,
         (1, FIELD_TOP_APPS, Input::Bool(on)) => settings.show_top_apps = on,
         (1, FIELD_WIFI, Input::Bool(on)) => settings.show_wifi = on,
+        (1, FIELD_WIFI_NAME, Input::Bool(on)) => settings.show_wifi_name = on,
         (1, FIELD_PING, Input::Text(host)) => settings.ping_host = host.trim().to_string(),
-        (6, FIELD_FIXED, Input::Number(value)) => set_fixed_percent(settings, value as f32),
         (1..=7, FIELD_ADD_VALUE, Input::Index(index)) => {
             let name = MODULES[page as usize - 1];
             // Entry 0 is the menu's title.
@@ -308,10 +436,13 @@ mod tests {
     #[test]
     fn every_row_can_be_applied() {
         for page in 0..PAGES.len() as i64 {
-            let mut settings = Settings::default();
             for row in rows(page, &Settings::default()) {
+                let mut settings = Settings::default();
+                if page_opened_by(row.tag).is_some() {
+                    continue;
+                }
                 let (tag, input) = match row.control {
-                    Control::Heading => continue,
+                    Control::Heading | Control::Note(_) | Control::Curve(_) => continue,
                     Control::Checkbox(on) => (row.tag, Input::Bool(!on)),
                     Control::Segmented(_, index) => (row.tag, Input::Index(index)),
                     Control::Colors(color, _) => (row.tag, Input::Color(color)),
@@ -391,6 +522,55 @@ mod tests {
     }
 
     #[test]
+    fn the_slider_only_changes_a_fixed_active_preset() {
+        let mut settings = Settings { active_preset: "Cool".into(), ..Settings::default() };
+        let before = settings.presets.clone();
+        set_active_fixed_percent(&mut settings, 10.0);
+        assert_eq!(settings.presets, before);
+    }
+
+    #[test]
+    fn presets_can_be_added_renamed_retyped_and_deleted() {
+        let mut settings = Settings::default();
+        let start = settings.presets.len();
+        assert!(apply(&mut settings, PRESETS * 100 + FIELD_ADD_PRESET, Input::Index(1)));
+        assert_eq!(settings.presets.len(), start + 1);
+        assert!(apply(&mut settings, preset_tag(start, PRESET_NAME), Input::Text("Night".into())));
+        assert_eq!(settings.presets[start].name, "Night");
+        assert!(apply(&mut settings, preset_tag(start, PRESET_SPEED), Input::Number(30.0)));
+        assert_eq!(settings.presets[start].mode, FanMode::Fixed { percent: 30.0 });
+        assert!(apply(&mut settings, preset_tag(start, PRESET_KIND), Input::Index(1)));
+        assert!(matches!(settings.presets[start].mode, FanMode::Curve { .. }));
+        assert!(apply(&mut settings, preset_tag(start, PRESET_DELETE), Input::Index(1)));
+        assert_eq!(settings.presets.len(), start);
+    }
+
+    #[test]
+    fn auto_cannot_be_edited() {
+        let mut settings = Settings::default();
+        assert!(!apply(&mut settings, preset_tag(0, PRESET_NAME), Input::Text("x".into())));
+        assert!(!apply(&mut settings, preset_tag(0, PRESET_DELETE), Input::Index(1)));
+        assert_eq!(settings, Settings::default());
+    }
+
+    #[test]
+    fn curves_save_to_the_right_preset() {
+        let mut settings = Settings::default();
+        let points = vec![CurvePoint { temp_c: 50.0, percent: 50.0 }];
+        set_preset_curve(&mut settings, 2, points.clone());
+        assert_eq!(settings.presets[2].mode, FanMode::Curve { points });
+        assert_eq!(preset_index(preset_tag(2, PRESET_CURVE)), Some(2));
+    }
+
+    #[test]
+    fn every_preset_shows_on_the_page_with_its_controls() {
+        let form = rows(PRESETS, &Settings::default());
+        assert!(form.iter().any(|r| r.label == "Cool"));
+        assert!(form.iter().any(|r| matches!(r.control, Control::Curve(_))));
+        assert!(form.iter().any(|r| r.control == Control::Button("Add preset")));
+    }
+
+    #[test]
     fn spacing_is_clamped() {
         let mut settings = Settings::default();
         apply(&mut settings, FIELD_SPACING, Input::Number(500.0));
@@ -417,7 +597,12 @@ mod tests {
         let mut settings = Settings::default();
         apply(&mut settings, 100 + FIELD_PING, Input::Text(" 1.1.1.1 ".into()));
         assert_eq!(settings.ping_host, "1.1.1.1");
-        apply(&mut settings, 600 + FIELD_FIXED, Input::Number(140.0));
-        assert_eq!(fixed_percent(&settings), 100.0);
+        let settings_fixed = |s: &Settings| s.presets.iter().find_map(|p| match (&p.name[..], &p.mode) {
+            ("Fixed", FanMode::Fixed { percent }) => Some(*percent),
+            _ => None,
+        });
+        settings.active_preset = "Fixed".into();
+        set_active_fixed_percent(&mut settings, 140.0);
+        assert_eq!(settings_fixed(&settings), Some(100.0));
     }
 }

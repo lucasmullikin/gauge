@@ -44,6 +44,43 @@ pub struct Latest {
     pub battery: Option<Battery>,
     pub fan_state: FanState,
     pub install_message: Option<String>,
+    pub sensors: Vec<gauge_core::sensors::Reading>,
+    pub temperatures: Vec<gauge_core::sensors::AreaTemperature>,
+    pub device_batteries: Vec<gauge_core::battery::DeviceBattery>,
+}
+
+/// Every sensor by kind, hottest first. Most voltage, current and power channels read zero, so
+/// those are left out to keep the list useful.
+pub fn sensor_rows(readings: &[gauge_core::sensors::Reading], is_m1: bool, settings: &Settings) -> Vec<Row> {
+    use gauge_core::sensors::{Kind, sensor_name};
+    let sections = [
+        (Kind::Temperature, "Temperature"),
+        (Kind::Power, "Power"),
+        (Kind::Voltage, "Voltage"),
+        (Kind::Current, "Current"),
+    ];
+    let mut rows = Vec::new();
+    for (kind, title) in sections {
+        let mut group: Vec<_> = readings
+            .iter()
+            .filter(|r| r.kind == kind && (kind == Kind::Temperature || r.value.abs() >= 0.01))
+            .collect();
+        group.sort_by(|a, b| b.value.total_cmp(&a.value));
+        if group.is_empty() {
+            continue;
+        }
+        rows.push(header(title));
+        for reading in group {
+            let value = match kind {
+                Kind::Temperature => format_temperature(reading.value, settings.temperature_unit),
+                Kind::Power => format!("{:.2} W", reading.value),
+                Kind::Voltage => format!("{:.2} V", reading.value),
+                Kind::Current => format!("{:.2} A", reading.value),
+            };
+            rows.push(row(sensor_name(&reading.key, is_m1), value));
+        }
+    }
+    rows
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,13 +90,15 @@ pub enum Slot {
 }
 
 pub struct GraphSpec {
+    /// Says what a graph shows when a panel has more than one.
+    pub caption: Option<&'static str>,
     pub series: Vec<(&'static str, Slot)>,
     pub unit: Unit,
     pub height: f64,
 }
 
 pub fn graphs(module: &str, settings: &Settings) -> Vec<GraphSpec> {
-    let graph = |series, unit| GraphSpec { series, unit, height: 110.0 };
+    let graph = |series, unit| GraphSpec { caption: None, series, unit, height: 110.0 };
     match module {
         "network" => vec![graph(vec![("net.down", Slot::Primary), ("net.up", Slot::Secondary)], Unit::Rate)],
         "memory" => vec![graph(vec![("mem.used", Slot::Primary), ("mem.compressed", Slot::Secondary)], Unit::Percent)],
@@ -73,7 +112,7 @@ pub fn graphs(module: &str, settings: &Settings) -> Vec<GraphSpec> {
             };
             vec![
                 graph(vec![("fan.0", Slot::Primary), ("fan.1", Slot::Secondary)], Unit::Rpm),
-                GraphSpec { series: vec![("temp.hot", Slot::Secondary)], unit: temperature, height: 56.0 },
+                GraphSpec { caption: Some("Hottest sensor"), series: vec![("temp.hot", Slot::Secondary)], unit: temperature, height: 72.0 },
             ]
         }
         "battery" => vec![graph(vec![("battery.percent", Slot::Primary)], Unit::Percent)],
@@ -390,6 +429,9 @@ fn network_content(latest: &Latest, settings: &Settings) -> Content {
         latest.ping_ms.map_or_else(|| "No reply".to_string(), |ms| format!("{ms:.0} ms")),
     ));
     if settings.show_wifi && let Some(wifi) = &latest.wifi {
+        if settings.show_wifi_name {
+            rows.push(row("Wi-Fi network", wifi.ssid.clone().unwrap_or_else(|| "Needs Location permission".to_string())));
+        }
         let quality = quality_label(snr(wifi.rssi_dbm, wifi.noise_dbm));
         rows.push(row("Wi-Fi signal", format!("{} dBm, {quality}", wifi.rssi_dbm)));
         rows.push(row("Wi-Fi speed", format!("{:.0} Mb/s", wifi.transmit_mbps)));
@@ -548,8 +590,22 @@ fn fans_content(latest: &Latest, settings: &Settings) -> Content {
     if let Some(message) = &latest.install_message {
         rows.push(row("Installer", message.clone()));
     }
+    if !latest.temperatures.is_empty() {
+        rows.push(header("Temperatures"));
+        for area in &latest.temperatures {
+            rows.push(row(
+                area.area,
+                format!(
+                    "{} avg, {} peak",
+                    format_temperature(area.average_c, settings.temperature_unit),
+                    format_temperature(area.peak_c, settings.temperature_unit)
+                ),
+            ));
+        }
+    }
     if let Some((key, c)) = &latest.hottest {
-        rows.push(row("Hottest sensor", format!("{key} {}", format_temperature(*c, settings.temperature_unit))));
+        let name = gauge_core::sensors::sensor_name(key, gauge_core::sensors::is_m1_mac());
+        rows.push(row("Hottest", format!("{name}, {}", format_temperature(*c, settings.temperature_unit))));
     }
     Content {
         title: "Fans".into(),
@@ -560,8 +616,18 @@ fn fans_content(latest: &Latest, settings: &Settings) -> Content {
 }
 
 fn battery_content(latest: &Latest, settings: &Settings) -> Content {
+    let device_rows = || {
+        let mut rows = Vec::new();
+        if !latest.device_batteries.is_empty() {
+            rows.push(header("Devices"));
+            for device in &latest.device_batteries {
+                rows.push(row(device.name.clone(), format!("{}%", device.percent)));
+            }
+        }
+        rows
+    };
     let Some(b) = &latest.battery else {
-        return Content { title: "Battery".into(), subtitle: "None".into(), ..Content::default() };
+        return Content { title: "Battery".into(), subtitle: "None".into(), rows: device_rows(), ..Content::default() };
     };
     let state = match (b.charging, b.external_power, b.fully_charged) {
         (_, _, Some(true)) => "Charged",
@@ -585,6 +651,7 @@ fn battery_content(latest: &Latest, settings: &Settings) -> Content {
     if let Some(m) = b.minutes_remaining {
         rows.push(row("Time left", format!("{}h {:02}m", m / 60, m % 60)));
     }
+    rows.extend(device_rows());
     Content {
         title: "Battery".into(),
         subtitle: String::new(),
@@ -793,7 +860,7 @@ mod tests {
         let got = content("fans", &latest, &settings);
         assert_eq!(value(&got, "Fan 1"), "2480 rpm, Manual");
         assert_eq!(value(&got, "Status"), "Fan helper not installed");
-        assert_eq!(value(&got, "Hottest sensor"), "Tp0c 62°C");
+        assert_eq!(value(&got, "Hottest"), "CPU sensor Tp0c, 62°C");
     }
 
     #[test]
@@ -833,6 +900,63 @@ mod tests {
         assert_eq!(items[0].name, "fans");
         assert!(items[0].shown);
         assert!(!items[1].shown, "GPU is hidden by default");
+    }
+
+    #[test]
+    fn sensor_list_groups_sorts_and_hides_idle_channels() {
+        use gauge_core::sensors::{Kind, Reading};
+        let reading = |key: &str, kind, value| Reading { key: key.into(), kind, value };
+        let got = sensor_rows(
+            &[
+                reading("Tp01", Kind::Temperature, 50.0),
+                reading("Tp0D", Kind::Temperature, 70.0),
+                reading("VP0R", Kind::Voltage, 0.0),
+                reading("PSTR", Kind::Power, 12.5),
+            ],
+            true,
+            &Settings::default(),
+        );
+        let keys: Vec<&str> = got.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, ["Temperature", "CPU performance core 3", "CPU performance core 1", "Power", "Sensor PSTR"]);
+        assert_eq!(got[4].value, "12.50 W");
+    }
+
+    #[test]
+    fn wifi_name_shows_only_when_asked_and_says_why_it_is_missing() {
+        let wifi = Wifi {
+            interface: None,
+            ssid: None,
+            rssi_dbm: -43,
+            noise_dbm: -90,
+            transmit_mbps: 1200.0,
+            channel: None,
+        };
+        let latest = Latest { wifi: Some(wifi), ..Latest::default() };
+        assert!(!content("network", &latest, &Settings::default()).rows.iter().any(|r| r.key == "Wi-Fi network"));
+        let on = Settings { show_wifi_name: true, ..Settings::default() };
+        assert_eq!(value(&content("network", &latest, &on), "Wi-Fi network"), "Needs Location permission");
+    }
+
+    #[test]
+    fn device_batteries_appear_with_or_without_a_mac_battery() {
+        let latest = Latest {
+            device_batteries: vec![gauge_core::battery::DeviceBattery { name: "Magic Mouse".into(), percent: 42 }],
+            ..Latest::default()
+        };
+        assert_eq!(value(&content("battery", &latest, &Settings::default()), "Magic Mouse"), "42%");
+    }
+
+    #[test]
+    fn fan_panel_lists_temperatures_by_area() {
+        let latest = Latest {
+            temperatures: vec![gauge_core::sensors::AreaTemperature { area: "CPU", average_c: 62.0, peak_c: 78.0 }],
+            ..Latest::default()
+        };
+        let got = content("fans", &latest, &Settings::default());
+        assert!(got.rows.iter().any(|r| r.header && r.key == "Temperatures"));
+        assert_eq!(value(&got, "CPU"), "62°C avg, 78°C peak");
+        let plain = content("fans", &Latest::default(), &Settings::default());
+        assert!(!plain.rows.iter().any(|r| r.key == "Temperatures"));
     }
 
     #[test]

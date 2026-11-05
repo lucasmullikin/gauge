@@ -47,11 +47,116 @@ pub fn is_plausible(kind: Kind, value: f32) -> bool {
         }
 }
 
+/// M1-family temperature keys with known meanings. These facts come from community research,
+/// notably the Stats project. Keys change between chips, so they're only trusted on M1 Macs.
+const M1_NAMES: [(&str, &str); 18] = [
+    ("Tp09", "CPU efficiency core 1"),
+    ("Tp0T", "CPU efficiency core 2"),
+    ("Tp01", "CPU performance core 1"),
+    ("Tp05", "CPU performance core 2"),
+    ("Tp0D", "CPU performance core 3"),
+    ("Tp0H", "CPU performance core 4"),
+    ("Tp0L", "CPU performance core 5"),
+    ("Tp0P", "CPU performance core 6"),
+    ("Tp0X", "CPU performance core 7"),
+    ("Tp0b", "CPU performance core 8"),
+    ("Tg05", "GPU 1"),
+    ("Tg0D", "GPU 2"),
+    ("Tg0L", "GPU 3"),
+    ("Tg0T", "GPU 4"),
+    ("Tm02", "Memory 1"),
+    ("Tm06", "Memory 2"),
+    ("Tm08", "Memory 3"),
+    ("Tm09", "Memory 4"),
+];
+/// Reported for Apple Silicon generally.
+const APPLE_NAMES: [(&str, &str); 6] = [
+    ("TaLP", "Airflow left"),
+    ("TaRF", "Airflow right"),
+    ("TH0x", "SSD"),
+    ("TB1T", "Battery 1"),
+    ("TB2T", "Battery 2"),
+    ("TW0P", "Wi-Fi"),
+];
+
+/// A readable name. Keys with no known meaning keep their code, with only a broad area from
+/// the prefix, so a guess never looks like a fact.
+pub fn sensor_name(key: &str, is_m1: bool) -> String {
+    let known = is_m1
+        .then(|| M1_NAMES.iter().find(|(k, _)| *k == key))
+        .flatten()
+        .or_else(|| APPLE_NAMES.iter().find(|(k, _)| *k == key));
+    if let Some((_, name)) = known {
+        return (*name).to_string();
+    }
+    let area = match key.get(..2) {
+        Some("Tp") => "CPU sensor",
+        Some("Tg") => "GPU sensor",
+        Some("Tm") => "Memory sensor",
+        Some("TB") => "Battery sensor",
+        Some("TH") => "SSD sensor",
+        _ => "Sensor",
+    };
+    format!("{area} {key}")
+}
+
+/// Whether this Mac has an M1-family chip.
+pub fn is_m1_mac() -> bool {
+    let mut buffer = [0u8; 64];
+    let mut size = buffer.len();
+    // SAFETY: the name is NUL-terminated, and buffer has `size` writable bytes.
+    let code = unsafe {
+        libc::sysctlbyname(
+            c"machdep.cpu.brand_string".as_ptr(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    code == 0 && brand_is_m1(&String::from_utf8_lossy(&buffer[..size]))
+}
+
+pub fn brand_is_m1(brand: &str) -> bool {
+    brand.split_whitespace().any(|word| word == "M1")
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Reading {
     pub key: String,
     pub kind: Kind,
     pub value: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AreaTemperature {
+    pub area: &'static str,
+    pub average_c: f32,
+    pub peak_c: f32,
+}
+
+const AREAS: [(&str, &str); 5] = [("Tp", "CPU"), ("Tg", "GPU"), ("Tm", "Memory"), ("TH", "SSD"), ("TB", "Battery")];
+const AREA_MIN_C: f32 = 15.0;
+
+/// Average and peak per part of the Mac, going by each key's prefix. Only areas with readings
+/// appear. Unconnected sensors can read near zero, so they're left out of the average.
+pub fn temperature_areas(readings: &[Reading]) -> Vec<AreaTemperature> {
+    AREAS
+        .iter()
+        .filter_map(|(prefix, area)| {
+            let values: Vec<f32> = readings
+                .iter()
+                .filter(|r| r.kind == Kind::Temperature && r.key.starts_with(prefix) && r.value >= AREA_MIN_C)
+                .map(|r| r.value)
+                .collect();
+            let peak_c = values.iter().copied().max_by(f32::total_cmp)?;
+            Some(AreaTemperature {
+                area,
+                average_c: values.iter().sum::<f32>() / values.len() as f32,
+                peak_c,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -184,6 +289,43 @@ mod tests {
     }
 
     #[test]
+    fn areas_summarize_by_prefix_and_skip_dead_sensors() {
+        let reading = |key: &str, value| Reading { key: key.into(), kind: Kind::Temperature, value };
+        let got = temperature_areas(&[
+            reading("Tp01", 60.0),
+            reading("Tp05", 80.0),
+            reading("Tp09", 6.0),
+            reading("TB1T", 31.0),
+            Reading { key: "Tpxx".into(), kind: Kind::Power, value: 500.0 },
+        ]);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], AreaTemperature { area: "CPU", average_c: 70.0, peak_c: 80.0 });
+        assert_eq!(got[1].area, "Battery");
+    }
+
+    #[test]
+    fn known_keys_get_names_and_unknown_ones_keep_their_code() {
+        assert_eq!(sensor_name("Tp0D", true), "CPU performance core 3");
+        assert_eq!(sensor_name("TW0P", true), "Wi-Fi");
+        assert_eq!(sensor_name("TW0P", false), "Wi-Fi");
+        assert_eq!(sensor_name("Tp02", true), "CPU sensor Tp02");
+        assert_eq!(sensor_name("TCMz", true), "Sensor TCMz");
+    }
+
+    #[test]
+    fn m1_names_are_not_trusted_on_other_chips() {
+        assert_eq!(sensor_name("Tp0D", false), "CPU sensor Tp0D");
+    }
+
+    #[test]
+    fn recognizes_m1_family_brands() {
+        assert!(brand_is_m1("Apple M1 Max"));
+        assert!(brand_is_m1("Apple M1"));
+        assert!(!brand_is_m1("Apple M2 Max"));
+        assert!(!brand_is_m1("Apple M10"));
+    }
+
+    #[test]
     fn top_positions_are_the_largest_first() {
         assert_eq!(top_positions(&[(4, 40.0), (7, 90.0), (2, 60.0)], 2), [7, 2]);
         assert!(top_positions(&[], 2).is_empty());
@@ -198,14 +340,13 @@ mod tests {
     }
 
     #[test]
-    fn reads_this_macs_sensors_and_fans() {
+    fn reads_real_sensors_and_fans() {
         let sensors = Sensors::open().unwrap();
         assert!(sensors.read().iter().any(|r| r.kind == Kind::Temperature));
         let temperatures = sensors.read_kind(Kind::Temperature);
         assert!(!temperatures.is_empty());
         assert!(temperatures.iter().all(|r| r.kind == Kind::Temperature));
         let fans = sensors.fans().unwrap();
-        assert_eq!(fans.len(), 2);
-        assert!(fans[0].max_rpm > fans[0].min_rpm);
+        assert!(fans.iter().all(|fan| fan.max_rpm > fan.min_rpm));
     }
 }

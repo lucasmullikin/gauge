@@ -33,9 +33,9 @@ pub fn read() -> Vec<Gpu> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn reads_this_macs_gpu() {
-        let gpus = super::read();
-        assert_eq!(gpus[0].core_count, Some(32));
-        assert!(gpus[0].device_percent.is_some_and(|p| (0..=100).contains(&p)));
+    fn gpu_load_is_a_percentage() {
+        for gpu in super::read() {
+            assert!(gpu.device_percent.is_none_or(|p| (0..=100).contains(&p)));
+        }
     }
 }

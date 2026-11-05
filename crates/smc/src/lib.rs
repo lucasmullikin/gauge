@@ -303,13 +303,14 @@ mod tests {
     fn reads_fan_count_from_real_smc() {
         let smc = Smc::open().unwrap();
         assert!(smc.key_count().unwrap() > 0);
-        assert!(smc.read_u8("FNum").unwrap() > 0);
+        assert!(smc.read_u8("FNum").is_ok());
     }
 
     #[test]
     fn known_read_matches_the_checked_read() {
         let smc = Smc::open().unwrap();
-        let checked = smc.read_f32("F0Mx").unwrap();
+        // Fanless Macs have no fan keys to compare.
+        let Ok(checked) = smc.read_f32("F0Mx") else { return };
         assert_eq!(smc.read_known_f32(fourcc("F0Mx").unwrap()).unwrap(), checked);
     }
 
