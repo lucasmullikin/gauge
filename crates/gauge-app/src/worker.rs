@@ -7,7 +7,7 @@ use gauge_core::alerts::AlertTracker;
 use gauge_core::battery::{self, Battery, DeviceBattery};
 use gauge_core::drives::{self, DiskActivity, Volume};
 use gauge_core::gpu::{self, Gpu};
-use gauge_core::history::{History, local_day, month_start_day};
+use gauge_core::history::{History, local_day, local_midnight, month_start_day};
 use gauge_core::memory::{self, Memory, Pressure};
 use gauge_core::network::{self, AppTraffic, Counters, InterfaceRate};
 use gauge_core::ping;
@@ -29,7 +29,8 @@ const FAN_IDLE_EVERY: u64 = 3;
 const DRIVE_EVERY: u64 = 5;
 const WIFI_EVERY: u64 = 10;
 const ROUTE_EVERY: u64 = 10;
-const BATTERY_EVERY: u64 = 30;
+const POWER_EVERY: u64 = 2;
+const DEVICE_BATTERY_EVERY: u64 = 30;
 const FLUSH_EVERY: u64 = 60;
 const SMART_EVERY: u64 = 60;
 const SENSOR_LIST_EVERY: u64 = 3;
@@ -53,10 +54,11 @@ pub enum Update {
     Health(Vec<DriveHealth>),
     Fans(Vec<Fan>, Option<(String, f32)>),
     FanState(FanState),
-    Battery(Option<Battery>),
+    Battery(Option<Box<Battery>>),
     Sensors(Vec<Reading>),
     Temperatures(Vec<AreaTemperature>),
     DeviceBatteries(Vec<DeviceBattery>),
+    EnergyToday(f64),
 }
 
 pub struct Shared {
@@ -286,14 +288,26 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
             let _ = updates.send(Update::Wifi(wifi));
         }
 
-        if tick.is_multiple_of(BATTERY_EVERY) {
+        if tick.is_multiple_of(POWER_EVERY) {
             let battery = battery::read();
-            if let Some(percent) = battery.as_ref().and_then(|b| b.percent)
+            if let Some(battery) = &battery
                 && let Ok(mut history) = shared.history.lock()
             {
-                history.record("battery.percent", now, percent as f32);
+                if let Some(percent) = battery.percent {
+                    history.record("battery.percent", now, percent as f32);
+                }
+                if let Some(watts) = battery.load_watts {
+                    history.record("power.load", now, watts as f32);
+                }
+                history.record("power.in", now, battery.input_watts.unwrap_or(0.0) as f32);
             }
-            let _ = updates.send(Update::Battery(battery));
+            let _ = updates.send(Update::Battery(battery.map(Box::new)));
+            if let Ok(history) = shared.history.lock() {
+                let energy = history.energy_wh("power.load", local_midnight(now)).unwrap_or(0.0);
+                let _ = updates.send(Update::EnergyToday(energy));
+            }
+        }
+        if tick.is_multiple_of(DEVICE_BATTERY_EVERY) {
             let _ = updates.send(Update::DeviceBatteries(battery::read_devices()));
         }
 
@@ -351,9 +365,10 @@ pub fn absorb(latest: &mut crate::view::Latest, update: Update) {
             latest.hottest = hottest;
         }
         Update::FanState(state) => latest.fan_state = state,
-        Update::Battery(battery) => latest.battery = battery,
+        Update::Battery(battery) => latest.battery = battery.map(|b| *b),
         Update::Sensors(sensors) => latest.sensors = sensors,
         Update::Temperatures(areas) => latest.temperatures = areas,
         Update::DeviceBatteries(devices) => latest.device_batteries = devices,
+        Update::EnergyToday(watt_hours) => latest.energy_today_wh = watt_hours,
     }
 }

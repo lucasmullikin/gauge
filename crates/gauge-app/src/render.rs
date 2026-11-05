@@ -24,11 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const COLLECT_SECONDS: u64 = 9;
 
 fn seed(history: &mut History, now: i64, range: i64) {
-    let series: [(&str, f32); 14] = [
+    let series: [(&str, f32); 16] = [
         ("net.down", 6e6), ("net.up", 8e5), ("mem.used", 80.0), ("mem.compressed", 9.0),
         ("cpu.total", 35.0), ("gpu.device", 60.0), ("gpu.memory", 38.0), ("disk.read", 2e7),
         ("disk.write", 8e6), ("fan.0", 2600.0), ("fan.1", 2800.0), ("temp.hot", 70.0),
-        ("battery.percent", 76.0), ("ping", 4.0),
+        ("battery.percent", 76.0), ("ping", 4.0), ("power.load", 28.0), ("power.in", 47.0),
     ];
     let step = (range / 600).max(1);
     let mut t = now - range;
@@ -205,7 +205,7 @@ const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Made-up readings for public images, so no real addresses, apps or volume names appear.
 fn demo_latest() -> Latest {
-    use gauge_core::battery::Battery;
+    use gauge_core::battery::{Adapter, Battery};
     use gauge_core::drives::{DiskActivity, Volume};
     use gauge_core::gpu::Gpu;
     use gauge_core::memory::{Memory, Pressure};
@@ -345,21 +345,40 @@ fn demo_latest() -> Latest {
         hottest: Some(("Tp0c".into(), 71.0)),
         battery: Some(Battery {
             percent: Some(76),
-            health_percent: Some(92.0),
+            health_percent: Some(84.0),
             cycle_count: Some(240),
             voltage_mv: Some(12_400),
-            amperage_ma: Some(-900),
-            power_watts: Some(-11.2),
+            amperage_ma: Some(1500),
+            power_watts: Some(18.6),
             temperature_c: Some(31.0),
-            charging: Some(false),
-            external_power: Some(false),
+            charging: Some(true),
+            external_power: Some(true),
             fully_charged: Some(false),
-            minutes_remaining: Some(312),
+            minutes_remaining: None,
+            minutes_to_full: Some(75),
+            design_cycles: Some(1000),
+            nominal_mah: Some(7300),
+            design_mah: Some(8700),
+            remaining_mah: Some(5800),
+            adapter: Some(Adapter {
+                name: Some("96W USB-C Power Adapter".into()),
+                manufacturer: Some("Apple Inc.".into()),
+                rated_watts: Some(94),
+                volts: Some(20.0),
+                amps: Some(4.69),
+            }),
+            input_watts: Some(47.0),
+            input_volts: Some(19.96),
+            input_amps: Some(2.35),
+            load_watts: Some(28.0),
+            adapter_loss_watts: Some(1.6),
+            usb_out_watts: Some(1.9),
         }),
         fan_state: crate::fan_control::FanState::Holding,
         install_message: None,
         sensors: Vec::new(),
         device_batteries: Vec::new(),
+        energy_today_wh: 214.0,
         temperatures: vec![
             AreaTemperature { area: "CPU", average_c: 58.0, peak_c: 71.0 },
             AreaTemperature { area: "GPU", average_c: 52.0, peak_c: 60.0 },

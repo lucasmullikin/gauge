@@ -57,6 +57,7 @@ pub fn display_name(module: &str) -> String {
     match module {
         "cpu" => "CPU".to_string(),
         "gpu" => "GPU".to_string(),
+        "battery" => "Power".to_string(),
         other => {
             let mut letters = other.chars();
             letters.next().map_or_else(String::new, |first| first.to_uppercase().chain(letters).collect())

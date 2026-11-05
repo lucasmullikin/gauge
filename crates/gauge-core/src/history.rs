@@ -268,6 +268,23 @@ impl History {
         Ok(rows)
     }
 
+    /// Watt-hours used since `start`, from a series of watts. Saved minutes count for 60 seconds
+    /// each, and time with no readings counts as nothing.
+    pub fn energy_wh(&self, series: &str, start: i64) -> rusqlite::Result<f64> {
+        let saved: f64 = self.connection.query_row(
+            "SELECT COALESCE(SUM(avg), 0) FROM samples WHERE tier = ?1 AND series = ?2 AND t >= ?3",
+            params![TIER_MINUTE, series, start],
+            |row| row.get(0),
+        )?;
+        let waiting: f64 = self
+            .pending
+            .range((series.to_string(), start)..)
+            .take_while(|((name, _), _)| name == series)
+            .map(|(_, a)| a.sum / f64::from(a.count))
+            .sum();
+        Ok((saved + waiting) * MINUTE as f64 / HOUR as f64)
+    }
+
     /// Adds traffic to a day's total; it reaches disk at the next flush.
     pub fn add_total(&mut self, day: &str, interface: &str, bytes_in: u64, bytes_out: u64) {
         let entry = self.pending_totals.entry((day.to_string(), interface.to_string())).or_default();
@@ -309,6 +326,21 @@ pub fn format_time(t: i64) -> String {
     };
     let month = MONTHS.get(parts.tm_mon as usize).copied().unwrap_or("?");
     format!("{month} {}, {:02}:{:02}", parts.tm_mday, parts.tm_hour, parts.tm_min)
+}
+
+/// When today began, in local time.
+pub fn local_midnight(now: i64) -> i64 {
+    let moment: libc::time_t = now;
+    // SAFETY: all-zero is valid for tm, and these calls only use the pointers they're given.
+    unsafe {
+        let mut parts: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&moment, &mut parts);
+        parts.tm_hour = 0;
+        parts.tm_min = 0;
+        parts.tm_sec = 0;
+        parts.tm_isdst = -1;
+        libc::mktime(&mut parts)
+    }
 }
 
 pub fn month_start_day(now: i64) -> String {
@@ -493,6 +525,26 @@ mod tests {
         history.flush(T).unwrap();
         assert_eq!(history.totals_since("2026-11-01").unwrap(), (151, 16));
         assert_eq!(history.totals_since("2026-11-05").unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn energy_adds_up_minutes_of_power() {
+        let mut history = History::open_in_memory().unwrap();
+        for minute in 0..60 {
+            history.record("w", T + minute * 60, 100.0);
+        }
+        assert!((history.energy_wh("w", T).unwrap() - 100.0).abs() < 0.01);
+        history.flush(T + 1800).unwrap();
+        assert!((history.energy_wh("w", T).unwrap() - 100.0).abs() < 0.01, "saved and waiting both count");
+        assert!((history.energy_wh("w", T + 1800).unwrap() - 50.0).abs() < 0.01);
+        assert_eq!(history.energy_wh("none", T).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn midnight_is_today_and_within_a_day() {
+        let midnight = local_midnight(T);
+        assert!(midnight <= T && T - midnight < 90_000);
+        assert_eq!(local_day(midnight, 0), local_day(T, 0));
     }
 
     #[test]

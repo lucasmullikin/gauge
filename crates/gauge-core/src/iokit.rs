@@ -152,6 +152,20 @@ pub fn dict_string(value: &CFType, key: &str) -> Option<String> {
     as_string(&*dict.find(CFString::new(key))?)
 }
 
+/// Each entry of an array property, for reading lists of dictionaries.
+pub fn array_items(value: &CFType) -> Vec<CFType> {
+    let Some(array) = value.downcast::<core_foundation::array::CFArray>() else {
+        return Vec::new();
+    };
+    array
+        .get_all_values()
+        .into_iter()
+        .filter(|item| !item.is_null())
+        // SAFETY: a CFArray's entries are CF objects it keeps alive, and this retains each one.
+        .map(|item| unsafe { CFType::wrap_under_get_rule(item) })
+        .collect()
+}
+
 fn dict_ref(value: &CFType) -> Option<CFDictionaryRef> {
     value
         .instance_of::<CFDictionary>()

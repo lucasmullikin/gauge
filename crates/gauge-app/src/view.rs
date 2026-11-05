@@ -47,6 +47,7 @@ pub struct Latest {
     pub sensors: Vec<gauge_core::sensors::Reading>,
     pub temperatures: Vec<gauge_core::sensors::AreaTemperature>,
     pub device_batteries: Vec<gauge_core::battery::DeviceBattery>,
+    pub energy_today_wh: f64,
 }
 
 /// Every sensor by kind, hottest first. Most voltage, current and power channels read zero, so
@@ -115,7 +116,10 @@ pub fn graphs(module: &str, settings: &Settings) -> Vec<GraphSpec> {
                 GraphSpec { caption: Some("Hottest sensor"), series: vec![("temp.hot", Slot::Secondary)], unit: temperature, height: 72.0 },
             ]
         }
-        "battery" => vec![graph(vec![("battery.percent", Slot::Primary)], Unit::Percent)],
+        "battery" => vec![
+            graph(vec![("power.load", Slot::Primary), ("power.in", Slot::Secondary)], Unit::Watts),
+            GraphSpec { caption: Some("Battery charge"), series: vec![("battery.percent", Slot::Primary)], unit: Unit::Percent, height: 56.0 },
+        ],
         _ => Vec::new(),
     }
 }
@@ -152,6 +156,18 @@ pub fn format_memory(bytes: u64) -> String {
     }
 }
 
+pub fn format_watts(watts: f64) -> String {
+    if watts.abs() < 10.0 { format!("{watts:.1} W") } else { format!("{watts:.0} W") }
+}
+
+pub fn format_energy(watt_hours: f64) -> String {
+    if watt_hours >= 1000.0 { format!("{:.2} kWh", watt_hours / 1000.0) } else { format!("{watt_hours:.0} Wh") }
+}
+
+fn format_duration(minutes: i64) -> String {
+    format!("{}h {:02}m", minutes / 60, minutes % 60)
+}
+
 pub fn format_rate(bytes_per_sec: f64) -> String {
     format!("{}/s", format_bytes(bytes_per_sec))
 }
@@ -170,6 +186,7 @@ pub fn format_value(value: f32, unit: Unit) -> String {
         Unit::Rpm => format!("{value:.0} rpm"),
         Unit::Celsius => format!("{value:.0}°C"),
         Unit::Fahrenheit => format!("{value:.0}°F"),
+        Unit::Watts => format!("{value:.0} W"),
     }
 }
 
@@ -235,9 +252,12 @@ const FAN_TOKENS: &[Token] = &[
     token("Preset", "preset"),
 ];
 const BATTERY_TOKENS: &[Token] = &[
-    token("Charge", "percent"),
-    token("Power", "power"),
-    token("Health", "health"),
+    token("Power use", "load"),
+    token("Incoming power", "input"),
+    token("Battery charge", "percent"),
+    token("Battery power", "power"),
+    token("Battery health", "health"),
+    token("Energy used today", "today"),
 ];
 
 pub fn tokens(module: &str) -> &'static [Token] {
@@ -265,7 +285,7 @@ pub fn default_template(module: &str) -> &'static str {
         "gpu" => "GPU {percent}",
         "drives" => "{free} free",
         "fans" => "{rpm} rpm {temp}",
-        "battery" => "{percent}",
+        "battery" => "⚡︎{load}",
         _ => "",
     }
 }
@@ -342,6 +362,9 @@ fn token_value(module: &str, name: &str, latest: &Latest, settings: &Settings) -
         ("fans", "fan1") => or_missing(fan_rpm(0)),
         ("fans", "fan2") => or_missing(fan_rpm(1)),
         ("fans", "preset") => Some(settings.active_preset.clone()),
+        ("battery", "load") => or_missing(latest.battery.as_ref().and_then(|b| b.load_watts).map(format_watts)),
+        ("battery", "input") => or_missing(latest.battery.as_ref().and_then(|b| b.input_watts).map(format_watts)),
+        ("battery", "today") => Some(format_energy(latest.energy_today_wh)),
         ("battery", "percent") => or_missing(latest.battery.as_ref().and_then(|b| b.percent).map(|p| format!("{p}%"))),
         ("battery", "power") => or_missing(latest.battery.as_ref().and_then(|b| b.power_watts).map(|w| format!("{:.1} W", w.abs()))),
         ("battery", "health") => or_missing(latest.battery.as_ref().and_then(|b| b.health_percent).map(|h| format!("{h:.0}%"))),
@@ -615,47 +638,91 @@ fn fans_content(latest: &Latest, settings: &Settings) -> Content {
     }
 }
 
-fn battery_content(latest: &Latest, settings: &Settings) -> Content {
-    let device_rows = || {
-        let mut rows = Vec::new();
-        if !latest.device_batteries.is_empty() {
-            rows.push(header("Devices"));
-            for device in &latest.device_batteries {
-                rows.push(row(device.name.clone(), format!("{}%", device.percent)));
-            }
-        }
-        rows
-    };
-    let Some(b) = &latest.battery else {
-        return Content { title: "Battery".into(), subtitle: "None".into(), rows: device_rows(), ..Content::default() };
-    };
-    let state = match (b.charging, b.external_power, b.fully_charged) {
-        (_, _, Some(true)) => "Charged",
-        (Some(true), _, _) => "Charging",
-        (_, Some(true), _) => "On power",
+fn power_state(b: &Battery) -> &'static str {
+    match (b.fully_charged, b.charging, b.external_power) {
+        (Some(true), _, Some(true)) => "Plugged in, fully charged",
+        (_, Some(true), _) => "Charging",
+        (_, _, Some(true)) => "Plugged in, not charging",
         _ => "On battery",
+    }
+}
+
+fn power_content(latest: &Latest, settings: &Settings) -> Content {
+    let mut device_rows = Vec::new();
+    if !latest.device_batteries.is_empty() {
+        device_rows.push(header("Devices"));
+        for device in &latest.device_batteries {
+            device_rows.push(row(device.name.clone(), format!("{}%", device.percent)));
+        }
+    }
+    let Some(b) = &latest.battery else {
+        return Content { title: "Power".into(), subtitle: "No battery".into(), rows: device_rows, ..Content::default() };
     };
-    let mut rows = vec![row("State", state)];
-    if let Some(h) = b.health_percent {
-        rows.push(row("Health", format!("{h:.0}%")));
+    let watts = |value: Option<f64>| value.map_or_else(|| MISSING.to_string(), format_watts);
+    let mut rows = vec![header("Power now")];
+    rows.push(row("Using", watts(b.load_watts)));
+    if b.external_power == Some(true) {
+        rows.push(row("Incoming", watts(b.input_watts)));
+        if let (Some(volts), Some(amps)) = (b.input_volts, b.input_amps) {
+            rows.push(row("Incoming supply", format!("{volts:.1} V, {amps:.2} A")));
+        }
+        if let Some(loss) = b.adapter_loss_watts {
+            rows.push(row("Adapter loss, estimated", format_watts(loss)));
+        }
     }
-    if let Some(c) = b.cycle_count {
-        rows.push(row("Cycles", c.to_string()));
+    if let Some(watts) = b.power_watts.filter(|w| w.abs() >= 0.05) {
+        let direction = if watts > 0.0 { "Into battery" } else { "From battery" };
+        rows.push(row(direction, format_watts(watts.abs())));
     }
-    if let Some(w) = b.power_watts {
-        rows.push(row("Power", format!("{:.1} W", w.abs())));
+    if let Some(out) = b.usb_out_watts.filter(|w| *w >= 0.05) {
+        rows.push(row("Out to USB-C devices", format_watts(out)));
+    }
+    rows.push(row("Used today", format_energy(latest.energy_today_wh)));
+
+    if let Some(adapter) = &b.adapter {
+        rows.push(header("Power adapter"));
+        if let Some(name) = &adapter.name {
+            rows.push(row("Model", name.clone()));
+        }
+        if let (Some(rated), Some(volts), Some(amps)) = (adapter.rated_watts, adapter.volts, adapter.amps) {
+            rows.push(row("Supplying up to", format!("{rated} W, {volts:.0} V, {amps:.2} A")));
+        }
+        if let Some(load) = gauge_core::battery::adapter_load_percent(b.input_watts, adapter.rated_watts) {
+            rows.push(row("In use", format!("{load:.0}% of its limit")));
+        }
+    }
+
+    rows.push(header("Battery"));
+    if let Some(percent) = b.percent {
+        rows.push(row("Charge", format!("{percent}%")));
+    }
+    if let Some(minutes) = b.minutes_to_full.filter(|_| b.charging == Some(true)) {
+        rows.push(row("Time to full", format_duration(minutes)));
+    }
+    if let Some(minutes) = b.minutes_remaining.filter(|_| b.external_power != Some(true)) {
+        rows.push(row("Time left", format_duration(minutes)));
+    }
+    if let Some(health) = b.health_percent {
+        rows.push(row("Health", format!("{health:.0}%")));
+    }
+    if let Some(cycles) = b.cycle_count {
+        let of = b.design_cycles.map_or_else(String::new, |d| format!(" of {d}"));
+        rows.push(row("Cycles", format!("{cycles}{of}")));
+    }
+    if let (Some(nominal), Some(design)) = (b.nominal_mah, b.design_mah) {
+        rows.push(row("Capacity", format!("{nominal} of {design} mAh")));
+    }
+    if let (Some(volts), Some(amps)) = (b.voltage_mv, b.amperage_ma) {
+        rows.push(row("Voltage, current", format!("{:.2} V, {:.2} A", volts as f64 / 1000.0, amps as f64 / 1000.0)));
     }
     if let Some(t) = b.temperature_c {
         rows.push(row("Temperature", format_temperature(t, settings.temperature_unit)));
     }
-    if let Some(m) = b.minutes_remaining {
-        rows.push(row("Time left", format!("{}h {:02}m", m / 60, m % 60)));
-    }
-    rows.extend(device_rows());
+    rows.extend(device_rows);
     Content {
-        title: "Battery".into(),
-        subtitle: String::new(),
-        legend: vec![b.percent.map_or_else(|| "Charge".to_string(), |p| format!("Charge {p}%"))],
+        title: "Power".into(),
+        subtitle: power_state(b).to_string(),
+        legend: vec![format!("Using {}", watts(b.load_watts)), format!("Incoming {}", watts(b.input_watts.or(Some(0.0))))],
         rows,
     }
 }
@@ -668,7 +735,7 @@ pub fn content(module: &str, latest: &Latest, settings: &Settings) -> Content {
         "gpu" => gpu_content(latest),
         "drives" => drives_content(latest, settings),
         "fans" => fans_content(latest, settings),
-        "battery" => battery_content(latest, settings),
+        "battery" => power_content(latest, settings),
         _ => Content::default(),
     }
 }
@@ -944,6 +1011,95 @@ mod tests {
             ..Latest::default()
         };
         assert_eq!(value(&content("battery", &latest, &Settings::default()), "Magic Mouse"), "42%");
+    }
+
+    fn plugged_in() -> Battery {
+        Battery {
+            percent: Some(80),
+            health_percent: Some(84.0),
+            cycle_count: Some(613),
+            voltage_mv: Some(12_650),
+            amperage_ma: Some(1500),
+            power_watts: Some(18.975),
+            temperature_c: Some(31.0),
+            charging: Some(true),
+            external_power: Some(true),
+            fully_charged: Some(false),
+            minutes_remaining: None,
+            minutes_to_full: Some(75),
+            design_cycles: Some(1000),
+            nominal_mah: Some(7299),
+            design_mah: Some(8694),
+            remaining_mah: Some(5800),
+            adapter: Some(gauge_core::battery::Adapter {
+                name: Some("96W USB-C Power Adapter".into()),
+                manufacturer: Some("Apple Inc.".into()),
+                rated_watts: Some(94),
+                volts: Some(20.0),
+                amps: Some(4.69),
+            }),
+            input_watts: Some(47.0),
+            input_volts: Some(19.96),
+            input_amps: Some(2.35),
+            load_watts: Some(28.0),
+            adapter_loss_watts: Some(1.6),
+            usb_out_watts: Some(1.9),
+        }
+    }
+
+    #[test]
+    fn power_panel_shows_incoming_power_adapter_and_battery() {
+        let latest = Latest { battery: Some(plugged_in()), energy_today_wh: 1234.0, ..Latest::default() };
+        let got = content("battery", &latest, &Settings::default());
+        assert_eq!(got.title, "Power");
+        assert_eq!(got.subtitle, "Charging");
+        assert_eq!(value(&got, "Using"), "28 W");
+        assert_eq!(value(&got, "Incoming"), "47 W");
+        assert_eq!(value(&got, "Incoming supply"), "20.0 V, 2.35 A");
+        assert_eq!(value(&got, "Into battery"), "19 W");
+        assert_eq!(value(&got, "Out to USB-C devices"), "1.9 W");
+        assert_eq!(value(&got, "Used today"), "1.23 kWh");
+        assert_eq!(value(&got, "Model"), "96W USB-C Power Adapter");
+        assert_eq!(value(&got, "Supplying up to"), "94 W, 20 V, 4.69 A");
+        assert_eq!(value(&got, "In use"), "50% of its limit");
+        assert_eq!(value(&got, "Time to full"), "1h 15m");
+        assert_eq!(value(&got, "Cycles"), "613 of 1000");
+        assert_eq!(value(&got, "Capacity"), "7299 of 8694 mAh");
+    }
+
+    #[test]
+    fn unplugged_power_panel_hides_adapter_and_shows_time_left() {
+        let battery = Battery {
+            external_power: Some(false),
+            charging: Some(false),
+            adapter: None,
+            input_watts: None,
+            amperage_ma: Some(-1000),
+            power_watts: Some(-12.65),
+            minutes_remaining: Some(312),
+            ..plugged_in()
+        };
+        let latest = Latest { battery: Some(battery), ..Latest::default() };
+        let got = content("battery", &latest, &Settings::default());
+        assert_eq!(got.subtitle, "On battery");
+        assert_eq!(value(&got, "From battery"), "13 W");
+        assert_eq!(value(&got, "Time left"), "5h 12m");
+        assert!(!got.rows.iter().any(|r| r.key == "Incoming" || r.key == "Model"));
+        assert_eq!(got.legend[1], "Incoming 0.0 W");
+    }
+
+    #[test]
+    fn the_power_item_shows_what_the_mac_is_using() {
+        let latest = Latest { battery: Some(plugged_in()), ..Latest::default() };
+        assert_eq!(bar_title("battery", &latest, &Settings::default()), "⚡︎28 W");
+    }
+
+    #[test]
+    fn energy_reads_at_a_sensible_scale() {
+        assert_eq!(format_energy(450.4), "450 Wh");
+        assert_eq!(format_energy(1234.0), "1.23 kWh");
+        assert_eq!(format_watts(1.86), "1.9 W");
+        assert_eq!(format_watts(56.4), "56 W");
     }
 
     #[test]

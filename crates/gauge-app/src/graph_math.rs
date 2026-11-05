@@ -9,6 +9,7 @@ pub enum Unit {
     Rpm,
     Celsius,
     Fahrenheit,
+    Watts,
 }
 
 impl Unit {

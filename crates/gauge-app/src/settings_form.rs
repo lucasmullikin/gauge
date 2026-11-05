@@ -8,7 +8,7 @@ use gauge_core::settings::{
 };
 use gauge_core::curve::CurvePoint;
 
-pub const PAGES: [&str; 10] = ["General", "Network", "Memory", "CPU", "GPU", "Drives", "Fans", "Battery", "Alerts", "Fan presets"];
+pub const PAGES: [&str; 10] = ["General", "Network", "Memory", "CPU", "GPU", "Drives", "Fans", "Power", "Alerts", "Fan presets"];
 const GENERAL: i64 = 0;
 const ALERTS: i64 = 8;
 pub const PRESETS: i64 = 9;

@@ -26,7 +26,7 @@ Fan control so far has been tested with speed changes of about 200 rpm near maxi
 - **Drives:** free space, read and write speed, and NVMe health
 - **Fans:** live speed, temperature, and presets you can add, rename and delete, with fixed speeds or temperature curves
 - **Sensors:** a window listing every temperature, power, voltage and current reading. Named sensors are from community research and apply to M1 chips; the rest keep their raw codes
-- **Battery:** charge, health, cycles and power, plus wireless keyboards, mice and trackpads that report a charge
+- **Power:** power use, incoming wattage, voltage and current, the adapter's rating, energy used today, and battery charge, health, cycles and capacity, plus wireless keyboards, mice and trackpads that report a charge
 - **Graphs:** ranges from 10 minutes to All, which grows with the saved history, with line, area or bar styles
 - **Menu bar:** edit what each item says, add icons, adjust the spacing, and drag items into any order
 - **Alerts:** low disk space, high temperature, memory pressure and lost connection
