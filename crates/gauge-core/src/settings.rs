@@ -129,6 +129,10 @@ pub struct Settings {
     pub show_wifi_name: bool,
     pub launch_at_login: bool,
     pub alerts: Alerts,
+    /// The charge limit to keep macOS at. `None` leaves macOS's own setting alone; 100 is no limit.
+    pub charge_limit: Option<u8>,
+    /// Charging to full once, ignoring the limit until the battery is full.
+    pub top_up: bool,
     /// Menu bar items, leftmost first.
     pub order: Vec<String>,
     /// Extra points of space around each menu bar item.
@@ -156,6 +160,8 @@ impl Default for Settings {
             show_wifi_name: false,
             launch_at_login: false,
             alerts: Alerts::default(),
+            charge_limit: None,
+            top_up: false,
             order: MODULES.iter().map(|m| m.to_string()).collect(),
             item_spacing: DEFAULT_ITEM_SPACING,
             ping_host: String::new(),
@@ -320,6 +326,7 @@ impl Settings {
         settings.order = normalized_order(&settings.order);
         settings.item_spacing = settings.item_spacing.clamp(0.0, MAX_ITEM_SPACING);
         settings.normalize_presets();
+        settings.charge_limit = settings.charge_limit.map(|limit| limit.clamp(50, 100));
         for name in MODULES {
             if let Some(module) = settings.module_mut(name) {
                 module.range_index = module.range_index.min(RANGES_SECONDS.len() - 1);
@@ -434,6 +441,7 @@ mod tests {
             ..Settings::default()
         };
         settings.normalize_presets();
+        settings.charge_limit = settings.charge_limit.map(|limit| limit.clamp(50, 100));
         let names: Vec<&str> = settings.presets.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["Auto", "Quiet"]);
         assert_eq!(settings.presets[0].mode, FanMode::Auto);

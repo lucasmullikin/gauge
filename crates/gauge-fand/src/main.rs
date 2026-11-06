@@ -4,6 +4,8 @@
 //! temperatures stay too high or sensors disappear, and on startup and shutdown. If launchd
 //! restarts this after a crash, startup restores Auto too.
 
+mod charge_limit;
+
 use fan_proto::{
     CLIENT_TIMEOUT_SECONDS, Command, MAX_CONSECUTIVE_REVERTS, MAX_LINE_BYTES, SOCKET_PATH, Safety,
     ThermalGuard, clamp_rpm, parse_command, severity,
@@ -219,6 +221,10 @@ impl Daemon {
                 if self.release(fan) { "OK".into() } else { "ERR restore failed".into() }
             }
             Ok(Command::Auto(_)) => "ERR no such fan".into(),
+            Ok(Command::ChargeLimit(limit)) => {
+                charge_limit::set(limit);
+                "OK".into()
+            }
             Ok(Command::Set(fan, rpm)) => match self.apply(fan, rpm) {
                 Ok(applied) => format!("OK {applied:.0}"),
                 Err(e) => format!("ERR {e}"),

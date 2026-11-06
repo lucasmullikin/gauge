@@ -24,11 +24,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const COLLECT_SECONDS: u64 = 9;
 
 fn seed(history: &mut History, now: i64, range: i64) {
-    let series: [(&str, f32); 16] = [
+    let series: [(&str, f32); 17] = [
         ("net.down", 6e6), ("net.up", 8e5), ("mem.used", 80.0), ("mem.compressed", 9.0),
         ("cpu.total", 35.0), ("gpu.device", 60.0), ("gpu.memory", 38.0), ("disk.read", 2e7),
         ("disk.write", 8e6), ("fan.0", 2600.0), ("fan.1", 2800.0), ("temp.hot", 70.0),
-        ("battery.percent", 76.0), ("ping", 4.0), ("power.load", 28.0), ("power.in", 47.0),
+        ("battery.percent", 76.0), ("ping", 4.0), ("power.load", 28.0), ("power.in", 47.0), ("battery.temp", 31.0),
     ];
     let step = (range / 600).max(1);
     let mut t = now - range;
@@ -108,7 +108,7 @@ fn on_background(mtm: MainThreadMarker, view: &NSView, dark: bool) -> Retained<N
 pub fn run(args: &[String]) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("not on the main thread")?;
     let [kind, name, path, rest @ ..] = args else {
-        return Err("usage: --render panel MODULE FILE [dark] [real] | settings PAGE FILE [dark] | gallery a,b,c FILE [dark]".into());
+        return Err("usage: --render panel MODULE FILE [dark] [real] | power x FILE [dark] | settings PAGE FILE [dark] | gallery a,b,c FILE [dark]".into());
     };
     let dark = rest.iter().any(|a| a == "dark");
     let dummy: Retained<NSObject> = NSObject::new();
@@ -170,6 +170,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let drawn_at = SystemTime::now().duration_since(UNIX_EPOCH).map_or(now, |d| d.as_secs() as i64);
             panel.refresh_graphs(&history, &settings, drawn_at, true);
             write_png(&on_background(mtm, panel.root_view(), dark), path)
+        }
+        "power" => {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+            let mut history = History::open_in_memory().map_err(|e| e.to_string())?;
+            seed(&mut history, now, 3600);
+            let window = crate::power_window::PowerWindow::new(mtm, target, 6);
+            let latest = demo_latest();
+            window.refresh_text(&latest, &settings);
+            window.refresh_graphs(&history, &settings, now, true);
+            let content = window.content().ok_or("no content")?;
+            write_png(&on_background(mtm, &content, dark), path)
         }
         "sensors" => {
             // Real readings, so this is for checking only and isn't used for public images.
@@ -379,6 +390,14 @@ fn demo_latest() -> Latest {
         sensors: Vec::new(),
         device_batteries: Vec::new(),
         energy_today_wh: 214.0,
+        power: Some(gauge_core::battery::PowerSample {
+            adapter_watts: 47.0,
+            battery_watts: 19.0,
+            system_watts: 28.0,
+            display_watts: 8.0,
+        }),
+        charge_limit: Some(Some(80)),
+        charge_error: None,
         temperatures: vec![
             AreaTemperature { area: "CPU", average_c: 58.0, peak_c: 71.0 },
             AreaTemperature { area: "GPU", average_c: 52.0, peak_c: 60.0 },

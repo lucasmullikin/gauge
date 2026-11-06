@@ -259,6 +259,18 @@ impl Sensors {
             .map(|(position, c)| (self.keys[position].0.clone(), c))
     }
 
+    /// The whole-Mac power readings. Missing keys read as zero, and the display key is only
+    /// reported for some chips.
+    pub fn power(&self) -> crate::battery::PowerSample {
+        let watts = |key: &str| f64::from(self.smc.read_f32(key).unwrap_or(0.0).max(0.0));
+        crate::battery::PowerSample {
+            adapter_watts: watts("PDTR"),
+            battery_watts: watts("PPBR"),
+            system_watts: watts("PSTR"),
+            display_watts: watts("PDBR"),
+        }
+    }
+
     pub fn fans(&self) -> Result<Vec<Fan>, smc::Error> {
         let mut fans = Vec::new();
         for index in 0..self.smc.read_u8("FNum")? {

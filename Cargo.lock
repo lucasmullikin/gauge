@@ -117,6 +117,8 @@ dependencies = [
 name = "gauge-fand"
 version = "0.1.0"
 dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
  "fan-proto",
  "libc",
  "smc",

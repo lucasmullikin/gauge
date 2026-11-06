@@ -4,6 +4,7 @@ use crate::bar_image;
 use crate::graph_math::{Unit, fraction, log_floor, nice_max};
 use crate::order_view::PreviewCallbacks;
 use crate::panel::Panel;
+use crate::power_window::PowerWindow;
 use crate::settings_form::{self, Input};
 use crate::sensors_window::SensorsWindow;
 use crate::settings_window::SettingsWindow;
@@ -63,6 +64,7 @@ pub struct Ivars {
     latest: RefCell<Latest>,
     settings_window: RefCell<Option<SettingsWindow>>,
     sensors_window: RefCell<Option<SensorsWindow>>,
+    power_window: RefCell<Option<PowerWindow>>,
     location: RefCell<Option<Retained<CLLocationManager>>>,
     last_closed: Cell<Option<(usize, Instant)>>,
 }
@@ -189,6 +191,7 @@ define_class!(
                 }
             });
             self.refresh_open(true);
+            self.refresh_power_window(true);
         }
 
         #[unsafe(method(presetChanged:))]
@@ -216,6 +219,34 @@ define_class!(
         #[unsafe(method(openSensors:))]
         fn open_sensors(&self, _sender: &NSButton) {
             self.show_sensors();
+        }
+
+        #[unsafe(method(openPower:))]
+        fn open_power(&self, _sender: &NSButton) {
+            self.show_power_window();
+        }
+
+        #[unsafe(method(chargeLimitChanged:))]
+        fn charge_limit_changed(&self, sender: &NSSlider) {
+            let limit = sender.doubleValue().round() as u8;
+            self.change_settings(|settings| {
+                settings.charge_limit = Some(limit);
+                settings.top_up = false;
+            });
+            self.refresh_open(false);
+        }
+
+        #[unsafe(method(topUp:))]
+        fn top_up(&self, _sender: &NSButton) {
+            let latest_limit = self.ivars().latest.borrow().charge_limit.flatten();
+            self.change_settings(|settings| {
+                settings.top_up = !settings.top_up;
+                // Remember the limit that's in force, so finishing can put it back.
+                if settings.charge_limit.is_none() {
+                    settings.charge_limit = latest_limit;
+                }
+            });
+            self.refresh_open(false);
         }
 
         #[unsafe(method(openSettings:))]
@@ -249,6 +280,7 @@ impl Controller {
             latest: RefCell::new(Latest::default()),
             settings_window: RefCell::new(None),
             sensors_window: RefCell::new(None),
+            power_window: RefCell::new(None),
             location: RefCell::new(None),
             last_closed: Cell::new(None),
         });
@@ -340,6 +372,9 @@ impl Controller {
         {
             let mut latest = self.ivars().latest.borrow_mut();
             while let Ok(update) = self.ivars().updates.try_recv() {
+                if matches!(update, Update::TopUpFinished) {
+                    self.change_settings(|settings| settings.top_up = false);
+                }
                 worker::absorb(&mut latest, update);
                 changed = true;
             }
@@ -355,6 +390,34 @@ impl Controller {
         self.refresh_open(false);
         self.refresh_preview();
         self.refresh_sensors();
+        self.refresh_power_window(false);
+    }
+
+    fn refresh_power_window(&self, force: bool) {
+        let window = self.ivars().power_window.borrow();
+        let Some(window) = window.as_ref().filter(|w| w.window.isVisible()) else { return };
+        let settings = self.settings();
+        window.refresh_text(&self.ivars().latest.borrow(), &settings);
+        if let Ok(history) = self.ivars().shared.history.lock() {
+            window.refresh_graphs(&history, &settings, now_seconds(), force);
+        }
+    }
+
+    fn show_power_window(&self) {
+        let mtm = self.mtm();
+        if self.ivars().power_window.borrow().is_none() {
+            let index = MODULES.iter().position(|m| *m == "battery").unwrap_or(0) as isize;
+            let window = PowerWindow::new(mtm, self.target(), index);
+            *self.ivars().power_window.borrow_mut() = Some(window);
+        }
+        for module in self.ivars().modules.borrow().iter() {
+            module.panel.popover.close();
+        }
+        NSApplication::sharedApplication(mtm).activate();
+        if let Some(window) = &*self.ivars().power_window.borrow() {
+            window.window.makeKeyAndOrderFront(None);
+        }
+        self.refresh_power_window(true);
     }
 
     fn refresh_sensors(&self) {
@@ -781,6 +844,12 @@ impl Controller {
         self.spin(1.0);
         let visible = self.ivars().settings_window.borrow().as_ref().is_some_and(|w| w.window.isVisible());
         check("settings window opens", visible);
+        self.show_power_window();
+        self.spin(1.0);
+        let power_open = self.ivars().power_window.borrow().as_ref().is_some_and(|w| w.window.isVisible());
+        check("power window opens", power_open);
+        let flow_ready = view::power_flow(&self.ivars().latest.borrow()).is_some();
+        check("power flow has readings", flow_ready);
         self.show_sensors();
         self.spin(4.5);
         let sensor_count = self.ivars().latest.borrow().sensors.len();

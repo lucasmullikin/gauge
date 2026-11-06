@@ -8,3 +8,5 @@ license.workspace = true
 smc = { path = "../smc" }
 fan-proto = { path = "../fan-proto" }
 libc = "0.2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"

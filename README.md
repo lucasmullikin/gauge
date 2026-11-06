@@ -2,7 +2,7 @@
 
 A macOS menu bar system monitor written in Rust. It shows network speed, RAM, CPU, drives and fans in the menu bar. Click an item for a history graph and details.
 
-![Network, Memory and Fans panels with graphs](docs/images/panels-dark.png)
+![Network, Memory and Power panels](docs/images/panels-dark.png)
 
 *Images are drawn by the app using sample data.*
 
@@ -16,7 +16,7 @@ Tested on one machine only: an M1 Max MacBook Pro on macOS 27. Other Macs are un
 - Macs that use the lowercase `F0md` key, reportedly the M5, aren't supported.
 - Intel Macs aren't supported.
 
-On that Mac, fan control has been tested with both fans moving between 2,000 and 4,000 rpm, and with the return to Auto after a disconnect, a hang, a killed app and a crashed helper. Temperature curves have only run under heavy load, so their behavior at low temperatures hasn't been tested.
+On that Mac, fan control has been tested with both fans moving between 2,000 and 4,000 rpm, and with the return to Auto after a disconnect, a hang, a killed app and a crashed helper. Temperature curves have only run under heavy load, so their behavior at low temperatures hasn't been tested. The charge limit hasn't yet been tested stopping a real charge.
 
 ## Features
 
@@ -26,13 +26,18 @@ On that Mac, fan control has been tested with both fans moving between 2,000 and
 - **Drives:** free space, read and write speed, and NVMe health
 - **Fans:** live speed, temperature, and presets you can add, rename and delete, with fixed speeds or temperature curves
 - **Sensors:** a window listing every temperature, power, voltage and current reading. Named sensors are from community research and apply to M1 chips; the rest keep their raw codes
-- **Power:** power use, incoming wattage, voltage and current, the adapter's rating, energy used today, and battery charge, health, cycles and capacity, plus wireless keyboards, mice and trackpads that report a charge
+- **Power:** a diagram of power flowing from the adapter and battery to the display, USB, charging and the rest of the Mac, plus a window with adapter details, battery health, and graphs
+- **Charge limit:** sets the limit built into macOS 27, with Top Up to charge to full once. It needs the fan helper, and Gauge doesn't touch battery hardware directly
 - **Graphs:** ranges from 10 minutes to All, which grows with the saved history, with line, area or bar styles
 - **Menu bar:** edit what each item says, add icons, adjust the spacing, and drag items into any order
 - **Alerts:** low disk space, high temperature, memory pressure and lost connection
 - **Command line:** `gauge` prints every reading as JSON
 
 ## Screenshots
+
+The Power window, with power flow, battery and adapter details:
+
+![Power window with a flow diagram, cards and graphs](docs/images/power-window.png)
 
 Drives, CPU and GPU panels:
 

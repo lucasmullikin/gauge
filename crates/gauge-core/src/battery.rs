@@ -43,6 +43,59 @@ pub struct Adapter {
     pub amps: Option<f64>,
 }
 
+/// Live power readings from the hardware. These change faster than macOS's battery report, which
+/// can sit unchanged for a long time when unplugged.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub struct PowerSample {
+    pub adapter_watts: f64,
+    pub battery_watts: f64,
+    pub system_watts: f64,
+    pub display_watts: f64,
+}
+
+/// The limit macOS is enforcing, from `pmset -g battlimit`. The outer `None` means the output
+/// wasn't understood, which must not be mistaken for "no limit".
+pub fn parse_charge_limit(output: &str) -> Option<Option<u8>> {
+    let text = output.trim();
+    if text.contains("No battery level limits set") {
+        return Some(None);
+    }
+    if !text.contains("Battery level limits") {
+        return None;
+    }
+    let mut found = None;
+    for row in text.split('{').skip(1) {
+        let row = row.split('}').next().unwrap_or("");
+        let field = |name: &str| {
+            row.split(';').find_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().trim_matches('"').to_string())
+            })
+        };
+        let manual = field("chargeSocLimitReason").is_some_and(|r| r == "manualChargeLimit");
+        let live = field("Terminated").is_none_or(|t| t == "0");
+        if manual && live {
+            found = field("chargeSocLimitSoc").and_then(|v| v.parse::<u8>().ok());
+        }
+    }
+    Some(found)
+}
+
+pub fn read_charge_limit() -> Option<Option<u8>> {
+    let output = std::process::Command::new("/usr/bin/pmset").args(["-g", "battlimit"]).output().ok()?;
+    parse_charge_limit(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// What, if anything, needs changing. `desired` of `None` means Gauge isn't managing the limit, so
+/// one set in System Settings is left alone. 100 means no limit. Top Up lifts the limit for now.
+pub fn charge_change(desired: Option<u8>, top_up: bool, actual: Option<u8>) -> Option<Option<u8>> {
+    if desired.is_none() && !top_up {
+        return None;
+    }
+    let wanted = if top_up { None } else { desired.filter(|limit| *limit < 100) };
+    (wanted != actual).then_some(wanted)
+}
+
 /// macOS reports these in thousandths: milliwatts, millivolts and milliamps.
 pub fn from_milli(value: Option<i64>) -> Option<f64> {
     value.map(|v| v as f64 / 1000.0)
@@ -143,6 +196,44 @@ pub fn read() -> Option<Battery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_limits_from_pmset_output() {
+        assert_eq!(parse_charge_limit("No battery level limits set\n"), Some(None));
+        let active = "Battery level limits:\n(\n    {\n        Terminated = 0;\n        chargeSocLimitReason = manualChargeLimit;\n        chargeSocLimitSoc = 80;\n    }\n)";
+        assert_eq!(parse_charge_limit(active), Some(Some(80)));
+        let ended = active.replace("Terminated = 0", "Terminated = 1");
+        assert_eq!(parse_charge_limit(&ended), Some(None));
+        let other = active.replace("manualChargeLimit", "optimizedCharging");
+        assert_eq!(parse_charge_limit(&other), Some(None));
+    }
+
+    #[test]
+    fn unrecognized_pmset_output_is_not_treated_as_no_limit() {
+        assert_eq!(parse_charge_limit("pmset: something went wrong"), None);
+        assert_eq!(parse_charge_limit(""), None);
+    }
+
+    #[test]
+    fn a_limit_set_elsewhere_is_left_alone_until_gauge_is_asked() {
+        assert_eq!(charge_change(None, false, Some(70)), None);
+    }
+
+    #[test]
+    fn changes_are_sent_only_when_needed() {
+        assert_eq!(charge_change(Some(80), false, None), Some(Some(80)));
+        assert_eq!(charge_change(Some(80), false, Some(80)), None);
+        assert_eq!(charge_change(Some(100), false, Some(80)), Some(None));
+        assert_eq!(charge_change(Some(100), false, None), None);
+    }
+
+    #[test]
+    fn top_up_lifts_the_limit_and_finishing_restores_it() {
+        assert_eq!(charge_change(Some(80), true, Some(80)), Some(None));
+        assert_eq!(charge_change(Some(80), true, None), None);
+        assert_eq!(charge_change(Some(80), false, None), Some(Some(80)));
+        assert_eq!(charge_change(None, true, Some(70)), Some(None));
+    }
 
     #[test]
     fn thousandths_become_whole_units() {

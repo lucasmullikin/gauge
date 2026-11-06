@@ -124,6 +124,27 @@ impl FanDriver {
         self.connection.is_some()
     }
 
+    /// Asks the helper to change macOS's charge limit. Uses the fan connection if there is one,
+    /// since opening a new connection would make the helper release the fans.
+    pub fn set_charge_limit(&mut self, limit: Option<u8>) -> Result<(), String> {
+        let command = limit.map_or_else(|| "LIMIT OFF".to_string(), |l| format!("LIMIT {l}"));
+        let reply = match &mut self.connection {
+            Some(connection) => connection.ask(&command),
+            None => Connection::open().and_then(|mut connection| connection.ask(&command)),
+        }
+        .map_err(|error| {
+            if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) {
+                "Fan helper not installed".to_string()
+            } else {
+                format!("Helper error: {error}")
+            }
+        })?;
+        match reply.strip_prefix("ERR ") {
+            Some(reason) => Err(reason.to_string()),
+            None => Ok(()),
+        }
+    }
+
     /// Called every couple of seconds. Each request also tells the helper the app is alive.
     pub fn step(&mut self, mode: &FanMode, fans: &[Fan], hottest_c: Option<f32>) -> FanState {
         if *mode == FanMode::Auto {

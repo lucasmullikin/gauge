@@ -1,5 +1,6 @@
 //! The click panel for one monitor: graph first, then details, as chosen from the mockups.
 
+use crate::flow_view::FlowView;
 use crate::graph_view::{GraphData, GraphView, SeriesData};
 use crate::ui::{fix_width, horizontal_stack, label, legend_text, rows_text, vertical_stack};
 use crate::view::{self, Content, GraphSpec, Latest, Slot};
@@ -50,6 +51,14 @@ fn segmented(mtm: MainThreadMarker, labels: &[&str], target: &AnyObject, action:
     control
 }
 
+pub struct ChargeControls {
+    pub flow: Retained<FlowView>,
+    pub limit_label: Retained<NSTextField>,
+    pub slider: Retained<NSSlider>,
+    pub top_up: Retained<NSButton>,
+    pub install: Retained<NSButton>,
+}
+
 pub struct FanControls {
     pub presets: Retained<NSSegmentedControl>,
     pub fixed_row: Retained<NSStackView>,
@@ -69,6 +78,7 @@ pub struct Panel {
     legend: Retained<NSTextField>,
     details: Retained<NSTextField>,
     fan: Option<FanControls>,
+    charge: Option<ChargeControls>,
     last_content: RefCell<Content>,
     last_graph_at: Cell<i64>,
 }
@@ -114,10 +124,41 @@ impl Panel {
             FanControls { presets, fixed_row, slider, install }
         });
 
+        let is_power = module == "battery";
         let range = segmented(mtm, &RANGE_LABELS, target, sel!(rangeChanged:), index as isize);
-        root.addArrangedSubview(&range);
+        // The Power panel leads with its flow diagram; its graphs are in the Power window.
+        if !is_power {
+            root.addArrangedSubview(&range);
+        }
+        let charge = is_power.then(|| {
+            let flow = FlowView::new(mtm, CONTENT_WIDTH, 170.0);
+            root.addArrangedSubview(&flow);
+            let line = horizontal_stack(mtm, 8.0);
+            let limit_label = label(mtm, "", TEXT_SIZE, true);
+            line.addArrangedSubview(&limit_label);
+            // SAFETY: the target outlives the panel and implements the action.
+            let top_up = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("Top Up"), Some(target), Some(sel!(topUp:)), mtm)
+            };
+            line.addArrangedSubview(&top_up);
+            root.addArrangedSubview(&line);
+            // SAFETY: the target outlives the panel and implements the action.
+            let slider = unsafe {
+                NSSlider::sliderWithValue_minValue_maxValue_target_action(100.0, 50.0, 100.0, Some(target), Some(sel!(chargeLimitChanged:)), mtm)
+            };
+            slider.setNumberOfTickMarks(11);
+            slider.setAllowsTickMarkValuesOnly(true);
+            fix_width(&slider, CONTENT_WIDTH);
+            root.addArrangedSubview(&slider);
+            // SAFETY: the target outlives the panel and implements the action.
+            let install = unsafe {
+                NSButton::buttonWithTitle_target_action(&NSString::from_str("Install helper…"), Some(target), Some(sel!(installHelper:)), mtm)
+            };
+            root.addArrangedSubview(&install);
+            ChargeControls { flow, limit_label, slider, top_up, install }
+        });
 
-        let specs = view::graphs(module, settings);
+        let specs = if is_power { Vec::new() } else { view::graphs(module, settings) };
         let graphs: Vec<(Retained<GraphView>, GraphSpec)> = specs
             .into_iter()
             .map(|spec| {
@@ -135,11 +176,15 @@ impl Panel {
         let since = label(mtm, "", 11.0, false);
         since.setTextColor(Some(&objc2_app_kit::NSColor::secondaryLabelColor()));
         fix_width(&since, CONTENT_WIDTH);
-        root.addArrangedSubview(&since);
+        if module != "battery" {
+            root.addArrangedSubview(&since);
+        }
 
         let legend = label(mtm, "", TEXT_SIZE, false);
         fix_width(&legend, CONTENT_WIDTH);
-        root.addArrangedSubview(&legend);
+        if !is_power {
+            root.addArrangedSubview(&legend);
+        }
 
         let details = NSTextField::wrappingLabelWithString(&NSString::from_str(""), mtm);
         details.setSelectable(false);
@@ -151,6 +196,9 @@ impl Panel {
         let mut buttons = vec![("Settings…", sel!(openSettings:)), ("Quit Gauge", sel!(quit:))];
         if module == "fans" {
             buttons.insert(0, ("All sensors…", sel!(openSensors:)));
+        }
+        if module == "battery" {
+            buttons.insert(0, ("Details…", sel!(openPower:)));
         }
         for (text, action) in buttons {
             // SAFETY: the target outlives the panel and implements the action.
@@ -180,6 +228,7 @@ impl Panel {
             legend,
             details,
             fan,
+            charge,
             last_content: RefCell::new(Content::default()),
             last_graph_at: Cell::new(0),
         }
@@ -194,6 +243,9 @@ impl Panel {
         let content = view::content(self.module, latest, settings);
         if let Some(fan) = &self.fan {
             self.refresh_fan(fan, latest, settings);
+        }
+        if let Some(charge) = &self.charge {
+            self.refresh_charge(charge, latest, settings);
         }
         if *self.last_content.borrow() == content {
             return;
@@ -213,6 +265,20 @@ impl Panel {
         let rows_changed = self.last_content.borrow().rows.len() != content.rows.len();
         *self.last_content.borrow_mut() = content;
         if rows_changed {
+            self.fit();
+        }
+    }
+
+    fn refresh_charge(&self, charge: &ChargeControls, latest: &Latest, settings: &Settings) {
+        charge.flow.set_flow(view::power_flow(latest));
+        let text = view::charge_limit_label(settings.charge_limit, latest.charge_limit, settings.top_up);
+        charge.limit_label.setStringValue(&NSString::from_str(&text));
+        charge.slider.setDoubleValue(view::slider_position(settings.charge_limit, latest.charge_limit));
+        let title = if settings.top_up { "Cancel Top Up" } else { "Top Up" };
+        charge.top_up.setTitle(&NSString::from_str(title));
+        let show_install = latest.charge_error.as_deref() == Some("Fan helper not installed");
+        if charge.install.isHidden() == show_install {
+            charge.install.setHidden(!show_install);
             self.fit();
         }
     }
@@ -301,6 +367,11 @@ impl Panel {
         let mut left = f64::MAX;
         let mut right = f64::MAX;
         for view in views.into_iter().chain(graphs) {
+            // Some panels leave out parts, like the Power panel's time range.
+            // SAFETY: a plain read of the view hierarchy on the main thread.
+            if unsafe { view.superview() }.is_none() {
+                continue;
+            }
             let frame = view.convertRect_toView(view.bounds(), Some(&self.root));
             left = left.min(frame.origin.x);
             right = right.min(width - frame.origin.x - frame.size.width);

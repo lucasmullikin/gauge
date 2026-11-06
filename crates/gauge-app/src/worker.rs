@@ -4,7 +4,7 @@
 use crate::fan_control::{FanDriver, FanState};
 use crate::view::{DiskRate, memory_percent};
 use gauge_core::alerts::AlertTracker;
-use gauge_core::battery::{self, Battery, DeviceBattery};
+use gauge_core::battery::{self, Battery, DeviceBattery, PowerSample, charge_change};
 use gauge_core::drives::{self, DiskActivity, Volume};
 use gauge_core::gpu::{self, Gpu};
 use gauge_core::history::{History, local_day, local_midnight, month_start_day};
@@ -30,6 +30,7 @@ const DRIVE_EVERY: u64 = 5;
 const WIFI_EVERY: u64 = 10;
 const ROUTE_EVERY: u64 = 10;
 const POWER_EVERY: u64 = 2;
+const CHARGE_EVERY: u64 = 3;
 const DEVICE_BATTERY_EVERY: u64 = 30;
 const FLUSH_EVERY: u64 = 60;
 const SMART_EVERY: u64 = 60;
@@ -59,6 +60,9 @@ pub enum Update {
     Temperatures(Vec<AreaTemperature>),
     DeviceBatteries(Vec<DeviceBattery>),
     EnergyToday(f64),
+    Power(PowerSample),
+    ChargeLimit(Option<Option<u8>>, Option<String>),
+    TopUpFinished,
 }
 
 pub struct Shared {
@@ -300,16 +304,38 @@ pub fn run(updates: Sender<Update>, shared: Arc<Shared>) {
                 if let Some(percent) = battery.percent {
                     history.record("battery.percent", now, percent as f32);
                 }
-                if let Some(watts) = battery.load_watts {
-                    history.record("power.load", now, watts as f32);
+                if let Some(celsius) = battery.temperature_c {
+                    history.record("battery.temp", now, celsius);
                 }
-                history.record("power.in", now, battery.input_watts.unwrap_or(0.0) as f32);
+            }
+            if let Some(sensors) = &sensors {
+                let power = sensors.power();
+                if let Ok(mut history) = shared.history.lock() {
+                    history.record("power.load", now, power.system_watts as f32);
+                    history.record("power.in", now, power.adapter_watts as f32);
+                }
+                let _ = updates.send(Update::Power(power));
+            }
+            if settings.top_up && battery.as_ref().and_then(|b| b.percent).is_some_and(|p| p >= 100) {
+                let _ = updates.send(Update::TopUpFinished);
             }
             let _ = updates.send(Update::Battery(battery.map(Box::new)));
             if let Ok(history) = shared.history.lock() {
                 let energy = history.energy_wh("power.load", local_midnight(now)).unwrap_or(0.0);
                 let _ = updates.send(Update::EnergyToday(energy));
             }
+        }
+        // Checked often enough that slider changes apply quickly, and a limit changed in System
+        // Settings shows up. Reading it is cheap, and nothing is written unless it differs.
+        if tick.is_multiple_of(CHARGE_EVERY) {
+            let actual = battery::read_charge_limit();
+            let mut error = None;
+            if let Some(actual) = actual
+                && let Some(wanted) = charge_change(settings.charge_limit, settings.top_up, actual)
+            {
+                error = driver.set_charge_limit(wanted).err();
+            }
+            let _ = updates.send(Update::ChargeLimit(actual, error));
         }
         if tick.is_multiple_of(DEVICE_BATTERY_EVERY) {
             let _ = updates.send(Update::DeviceBatteries(battery::read_devices()));
@@ -374,5 +400,11 @@ pub fn absorb(latest: &mut crate::view::Latest, update: Update) {
         Update::Temperatures(areas) => latest.temperatures = areas,
         Update::DeviceBatteries(devices) => latest.device_batteries = devices,
         Update::EnergyToday(watt_hours) => latest.energy_today_wh = watt_hours,
+        Update::Power(power) => latest.power = Some(power),
+        Update::ChargeLimit(actual, error) => {
+            latest.charge_limit = actual;
+            latest.charge_error = error;
+        }
+        Update::TopUpFinished => {}
     }
 }

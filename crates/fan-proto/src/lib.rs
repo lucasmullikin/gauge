@@ -16,7 +16,12 @@ pub enum Command {
     Status,
     Auto(u8),
     Set(u8, f32),
+    /// Sets macOS's own charge limit. `None` turns it off.
+    ChargeLimit(Option<u8>),
 }
+
+pub const MIN_CHARGE_LIMIT: u8 = 50;
+pub const MAX_CHARGE_LIMIT: u8 = 99;
 
 pub fn parse_command(line: &str) -> Result<Command, String> {
     if line.len() > MAX_LINE_BYTES {
@@ -33,6 +38,13 @@ pub fn parse_command(line: &str) -> Result<Command, String> {
         ["BEAT"] => Ok(Command::Beat),
         ["STATUS"] => Ok(Command::Status),
         ["AUTO", f] => Ok(Command::Auto(fan(f)?)),
+        ["LIMIT", "OFF"] => Ok(Command::ChargeLimit(None)),
+        ["LIMIT", percent] => percent
+            .parse::<u8>()
+            .ok()
+            .filter(|p| (MIN_CHARGE_LIMIT..=MAX_CHARGE_LIMIT).contains(p))
+            .map(|p| Command::ChargeLimit(Some(p)))
+            .ok_or_else(|| "bad limit".to_string()),
         ["SET", f, rpm] => {
             let rpm: f32 = rpm.parse().map_err(|_| "bad rpm".to_string())?;
             if !rpm.is_finite() {
@@ -118,11 +130,13 @@ mod tests {
         assert_eq!(parse_command("STATUS\n"), Ok(Command::Status));
         assert_eq!(parse_command("AUTO 1"), Ok(Command::Auto(1)));
         assert_eq!(parse_command("SET 0 2500"), Ok(Command::Set(0, 2500.0)));
+        assert_eq!(parse_command("LIMIT 80"), Ok(Command::ChargeLimit(Some(80))));
+        assert_eq!(parse_command("LIMIT OFF"), Ok(Command::ChargeLimit(None)));
     }
 
     #[test]
     fn rejects_everything_else() {
-        for line in ["", "SET 0", "SET 0 NaN", "SET 0 inf", "SET 99 2000", "SET x 2", "AUTO", "rm -rf", "SET 0 1 2"] {
+        for line in ["", "SET 0", "SET 0 NaN", "SET 0 inf", "SET 99 2000", "SET x 2", "AUTO", "rm -rf", "SET 0 1 2", "LIMIT", "LIMIT 10", "LIMIT 100", "LIMIT -1", "LIMIT 80 x"] {
             assert!(parse_command(line).is_err(), "{line}");
         }
         assert!(parse_command(&"B".repeat(MAX_LINE_BYTES + 1)).is_err());
